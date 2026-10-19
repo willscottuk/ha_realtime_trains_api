@@ -1,6 +1,7 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
+import math
 import re
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -53,6 +54,19 @@ TIMEZONE = ZoneInfo('Europe/London')
 # per-minute rate budget.
 JOURNEY_DATA_CONCURRENCY = 2
 
+# Journey details are cached per service. A calling pattern doesn't change
+# during the day, so each train is looked up once when it first appears; only
+# the next departure is looked up again (at most this often, and only when it
+# leaves soon) to keep its live position and arrival forecast current.
+JOURNEY_DATA_REFRESH_SECONDS = 600
+JOURNEY_DATA_REFRESH_WINDOW_MINUTES = 30
+# Cached entries for trains that are long gone are dropped after this long.
+JOURNEY_DATA_CACHE_MAX_AGE = timedelta(hours=4)
+
+# Share of each hourly/daily rate-limit budget held back for restarts and
+# manual refreshes when pacing polls.
+RATE_LIMIT_RESERVE_FRACTION = 0.05
+
 def _delta_seconds(hhmm_datetime_a: datetime, hhmm_datetime_b: datetime) -> float:
     a_trunc = hhmm_datetime_a.replace(second=0, microsecond=0)
     b_trunc = hhmm_datetime_b.replace(second=0, microsecond=0)
@@ -74,6 +88,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         peak_windows: list = None,
         auto_adjust_scans: bool = False,
         disruption_manager: DisruptionManager | None = None,
+        quiet_windows: list | None = None,
     ) -> None:
         """Initialize."""
         super().__init__(
@@ -87,6 +102,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.peak_interval = peak_interval
         self.off_peak_interval = off_peak_interval
         self.peak_windows = peak_windows or []
+        self.quiet_windows = quiet_windows or []
         self.auto_adjust_scans = auto_adjust_scans
         self.disruption_manager = disruption_manager or DisruptionManager()
         self.current_polling_interval = None
@@ -94,6 +110,11 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_successful_update: datetime | None = None
         self.data_stale = False
         self._station_name_cache: dict[str, str] = {}
+        self._journey_cache: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
+
+        self._calls_per_poll: float | None = None
+        self._request_count_at_last_poll: int | None = None
+        self.budget_limited = False
 
     async def _async_refresh_token(self) -> bool:
         """Refresh the access token."""
@@ -104,31 +125,89 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.error("Failed to refresh RTT access token: %s", err)
             return False
 
-    async def _add_journey_data(self, train, scheduled_departure, estimated_departure, journey_start, journey_end):
-        """Populate journey data using service details."""
-        try:
-            data = await retry_with_auth_refresh(
-                lambda: self.api.fetch_service_details(
-                    train['service_uid'],
-                    scheduled_departure,
-                ),
-                self._async_refresh_token,
-                lambda err: _LOGGER.debug("Could not populate arrival times after retry: %s", err),
-            )
-        except RealtimeTrainsApiAuthError:
-            return "Credentials invalid"
-        except RealtimeTrainsApiRateLimitError as err:
-            _LOGGER.debug("Rate limit hit or preemptively skipped for journey data: %s", err)
-            return "Rate Limited"
-        except RealtimeTrainsApiNotFoundError:
-            _LOGGER.debug("Could not find %s in stops for service %s.", journey_end, train['service_uid'])
-            return None
-        except RealtimeTrainsApiError as err:
-            _LOGGER.debug("Could not populate arrival times: %s", err)
-            return None
+    def _cached_journey_data(
+        self, cache_key: tuple[str, str], now: datetime, may_refresh: bool
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Return (cached service details, whether they are due a refresh)."""
+        cached = self._journey_cache.get(cache_key)
+        if cached is None:
+            return None, True
+        fetched_at, data = cached
+        due = (
+            may_refresh
+            and (now - fetched_at).total_seconds() >= JOURNEY_DATA_REFRESH_SECONDS
+        )
+        return data, due
+
+    def _prune_journey_cache(self, now: datetime) -> None:
+        """Forget service details fetched too long ago to still be on a board."""
+        expired = [
+            key
+            for key, (fetched_at, _) in self._journey_cache.items()
+            if now - fetched_at > JOURNEY_DATA_CACHE_MAX_AGE
+        ]
+        for key in expired:
+            del self._journey_cache[key]
+
+    async def _add_journey_data(
+        self,
+        train,
+        scheduled_departure,
+        estimated_departure,
+        journey_start,
+        journey_end,
+        now: datetime | None = None,
+        may_refresh: bool = True,
+    ):
+        """Populate journey data using (cached) service details."""
+        if now is None:
+            now = cast(datetime, dt_util.now()).astimezone(TIMEZONE)
+        cache_key = (train['service_uid'], scheduled_departure.date().isoformat())
+        data, due = self._cached_journey_data(cache_key, now, may_refresh)
+
+        refresh_failed = False
+        if due:
+            try:
+                fetched = await retry_with_auth_refresh(
+                    lambda: self.api.fetch_service_details(
+                        train['service_uid'],
+                        scheduled_departure,
+                    ),
+                    self._async_refresh_token,
+                    lambda err: _LOGGER.debug("Could not populate arrival times after retry: %s", err),
+                )
+            except RealtimeTrainsApiAuthError:
+                if data is None:
+                    return "Credentials invalid"
+                refresh_failed = True
+            except RealtimeTrainsApiRateLimitError as err:
+                _LOGGER.debug("Rate limit hit or preemptively skipped for journey data: %s", err)
+                if data is None:
+                    return "Rate Limited"
+                refresh_failed = True
+            except RealtimeTrainsApiNotFoundError:
+                _LOGGER.debug("Could not find %s in stops for service %s.", journey_end, train['service_uid'])
+                if data is None:
+                    return None
+                refresh_failed = True
+            except RealtimeTrainsApiError as err:
+                _LOGGER.debug("Could not populate arrival times: %s", err)
+                if data is None:
+                    return None
+                refresh_failed = True
+            else:
+                if fetched is not None:
+                    self._journey_cache[cache_key] = (now, fetched)
+                    data = fetched
 
         if data is None:
             return None
+
+        # Arrival and position come from cached service details, so say how
+        # old they are, and flag them when a refresh that was due failed.
+        fetched_at = self._journey_cache[cache_key][0]
+        train["journey_data_updated_at"] = fetched_at.isoformat()
+        train["journey_data_stale"] = refresh_failed
 
         service = data.get("service", {})
         locations = service.get("locations", [])
@@ -233,6 +312,127 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current_time = now.time()
         return any(start <= current_time <= end for start, end in self.peak_windows)
 
+    def _quiet_window_end(self, now: datetime) -> datetime | None:
+        """Return when the current quiet window ends, or None outside quiet hours."""
+        current = now.time().replace(tzinfo=None)
+        for start, end in self.quiet_windows:
+            if start < end:
+                inside = start <= current < end
+            else:  # wraps past midnight
+                inside = current >= start or current < end
+            if inside:
+                end_dt = now.replace(
+                    hour=end.hour, minute=end.minute, second=0, microsecond=0
+                )
+                if end_dt <= now:
+                    end_dt += timedelta(days=1)
+                return end_dt
+        return None
+
+    @property
+    def estimated_calls_per_poll(self) -> float | None:
+        """Measured average API calls per poll, once known."""
+        return round(self._calls_per_poll, 1) if self._calls_per_poll is not None else None
+
+    def _estimate_calls_per_poll(self) -> float:
+        """Update and return the average number of API calls a poll makes."""
+        count = getattr(self.api, "request_count", None)
+        if isinstance(count, int) and not isinstance(count, bool):
+            if self._request_count_at_last_poll is not None:
+                made = count - self._request_count_at_last_poll
+                if made > 0:
+                    # Rise straight to a bigger poll, decay slowly from one,
+                    # so a burst of new trains isn't averaged away
+                    self._calls_per_poll = (
+                        float(made)
+                        if self._calls_per_poll is None or made > self._calls_per_poll
+                        else (self._calls_per_poll + made) / 2
+                    )
+            self._request_count_at_last_poll = count
+
+        if self._calls_per_poll is not None:
+            return self._calls_per_poll
+        # Nothing measured yet: assume the worst case of every lookup
+        return float(self._max_calls_per_poll())
+
+    def _max_calls_per_poll(self) -> int:
+        """Most calls one poll can make: every location lookup plus every
+        enrichment missing the journey cache at once."""
+        return sum(1 + (query.get(CONF_JOURNEYDATA, 0) or 0) for query in self.queries) or 1
+
+    def _planned_polls(self, now: datetime, until: datetime) -> float:
+        """Polls the configured schedule would make before `until` (none in quiet hours)."""
+        polls = 0.0
+        step = timedelta(minutes=1)
+        moment = now
+        while moment < until:
+            if self._quiet_window_end(moment) is not None:
+                moment += step
+                continue
+            interval = self.peak_interval if self._is_peak(moment) else self.off_peak_interval
+            polls += 60 / max(interval, 1)
+            moment += step
+        return polls
+
+    def _budget_interval(self, now: datetime, target_interval: int) -> int:
+        """Return a polling interval that keeps the hourly and daily budgets.
+
+        Reads the X-RateLimit-* values from the last response. If the
+        configured schedule would spend more than what's left before a
+        window resets, every interval is stretched by the same factor so
+        peak polling stays proportionally faster than off-peak. The hour
+        window resets on the clock hour and the day window at 00:00 UTC
+        (as observed from the API's counters).
+        """
+        calls_per_poll = self._estimate_calls_per_poll()
+        rate_limits = getattr(self.api, "rate_limits", None)
+        updated_at = getattr(self.api, "rate_limits_updated_at", None)
+        if not isinstance(rate_limits, dict) or not isinstance(updated_at, datetime):
+            self.budget_limited = False
+            return target_interval
+
+        now_utc = now.astimezone(timezone.utc)
+        interval = float(target_interval)
+        # Hold back enough for one worst-case poll on top of the average, so
+        # a poll where every enriched train misses the cache still fits
+        worst_case = max(self._max_calls_per_poll(), math.ceil(calls_per_poll))
+
+        windows = {
+            "hour": (now_utc.replace(minute=0, second=0, microsecond=0), timedelta(hours=1)),
+            "day": (now_utc.replace(hour=0, minute=0, second=0, microsecond=0), timedelta(days=1)),
+        }
+        for name, (window_start, length) in windows.items():
+            counts = rate_limits.get(name) or {}
+            limit = counts.get("limit")
+            remaining = counts.get("remaining")
+            if not isinstance(limit, int) or not isinstance(remaining, int) or limit <= 0:
+                continue
+            if updated_at < window_start:
+                remaining = limit  # the window has reset since we last heard
+            reset_at = window_start + length
+            seconds_left = (reset_at - now_utc).total_seconds()
+            reserve = max(math.ceil(limit * RATE_LIMIT_RESERVE_FRACTION), worst_case)
+            usable = remaining - reserve
+
+            if usable < calls_per_poll:
+                interval = max(interval, seconds_left + 1)
+                continue
+
+            planned = self._planned_polls(now, reset_at.astimezone(now.tzinfo or TIMEZONE))
+            if planned * calls_per_poll > usable:
+                stretched = target_interval * planned * calls_per_poll / usable
+                interval = max(interval, min(stretched, seconds_left + 1))
+
+        self.budget_limited = interval > target_interval
+        if self.budget_limited:
+            _LOGGER.debug(
+                "Pacing polls to the RTT rate limit: %s s instead of %s s (~%.1f calls per poll)",
+                int(interval),
+                target_interval,
+                calls_per_poll,
+            )
+        return max(target_interval, int(math.ceil(interval)))
+
     def _set_polling_interval(self, seconds: int) -> None:
         if self.current_polling_interval != seconds:
             self.current_polling_interval = seconds
@@ -328,6 +528,12 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         effective_departure = estimatedTs if estimatedTs is not None else scheduledTs
 
+        # The location line-up already carries delay/cancellation reasons, so
+        # every train gets one for free; journey enrichment may refine it.
+        reasons = departure.get("reasons") or []
+        first_reason = reasons[0] if reasons and isinstance(reasons[0], dict) else {}
+        disruption_reason = first_reason.get("shortText")
+
         return {
             "origin_name": origin_name,
             "destination_name": destination_name,
@@ -358,12 +564,23 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "destination_delay_minutes": None,
             "journey_duration_minutes": None,
             "stops_count": None,
-            "disruption_reason": None,
+            "disruption_reason": str(disruption_reason) if disruption_reason else None,
             "last_report_station": None,
             "last_report_type": None,
             "last_report_time": None,
             "last_report_time_label": None,
         }
+
+    @staticmethod
+    def _query_key(query: dict[str, Any]) -> str:
+        """Return the coordinator data key the sensors use for a query."""
+        platforms = query.get(CONF_PLATFORMS_OF_INTEREST, [])
+        if isinstance(platforms, str):
+            platforms = split_csv(platforms)
+        time_offset = coerce_time_offset(query.get(CONF_TIMEOFFSET, timedelta()), timedelta())
+        return build_query_key(
+            query.get(CONF_START), query.get(CONF_END), set(platforms), time_offset
+        )
 
     async def _fetch_one_query(
         self, query: dict[str, Any], now: datetime
@@ -388,7 +605,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             platforms = split_csv(platforms)
         platforms_of_interest = set(platforms)
 
-        query_key = build_query_key(origin, destination, platforms_of_interest, time_offset)
+        query_key = self._query_key(query)
 
         _LOGGER.debug(
             "Fetching location services for %s to %s at %s",
@@ -453,7 +670,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Enrichment failures no longer replace the numeric state; they are
         # surfaced separately so the sensor stays usable in automations.
-        error = await self._enrich_journey_data(enrichment, origin, destination)
+        error = await self._enrich_journey_data(enrichment, origin, destination, now)
 
         state = None
         if nextDepartureEstimatedTs is not None:
@@ -563,8 +780,14 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         trains: list[tuple[dict[str, Any], datetime, datetime]],
         origin: str,
         destination: str | None,
+        now: datetime | None = None,
     ) -> str | None:
         """Fetch journey details for the given trains with bounded concurrency.
+
+        Details come from the per-service cache where possible: a train is
+        looked up when first seen, and only the next departure, once it
+        leaves within JOURNEY_DATA_REFRESH_WINDOW_MINUTES, is looked up again
+        after JOURNEY_DATA_REFRESH_SECONDS.
 
         Returns the first error state encountered, if any. _add_journey_data
         swallows API errors into these state strings, so gather cannot raise
@@ -572,17 +795,24 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if not trains:
             return None
+        if now is None:
+            now = cast(datetime, dt_util.now()).astimezone(TIMEZONE)
 
         semaphore = asyncio.Semaphore(JOURNEY_DATA_CONCURRENCY)
+        refresh_window = timedelta(minutes=JOURNEY_DATA_REFRESH_WINDOW_MINUTES)
 
-        async def enrich(train, scheduledTs, estimatedTs):
+        async def enrich(index, train, scheduledTs, estimatedTs):
+            may_refresh = index == 0 and estimatedTs - now <= refresh_window
             async with semaphore:
                 return await self._add_journey_data(
-                    train, scheduledTs, estimatedTs, origin, destination
+                    train, scheduledTs, estimatedTs, origin, destination, now, may_refresh
                 )
 
         results = await asyncio.gather(
-            *(enrich(train, sched, est) for train, sched, est in trains)
+            *(
+                enrich(index, train, sched, est)
+                for index, (train, sched, est) in enumerate(trains)
+            )
         )
         return next((err for err in results if err), None)
 
@@ -590,32 +820,82 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Fetch data from API endpoint."""
         now = cast(datetime, dt_util.now()).astimezone(TIMEZONE)
 
-        target_interval = self.peak_interval if self._is_peak(now) else self.off_peak_interval
+        # During quiet hours the API isn't called and sensors keep their last
+        # values. The one exception is a start or reload with no data yet:
+        # that single fetch still runs, so sensors aren't unavailable for the
+        # rest of the window. Either way the next poll lands when it ends.
+        quiet_end = self._quiet_window_end(now)
+        last_known = getattr(self, "data", None)
+        if quiet_end is not None:
+            quiet_interval = max(60, int((quiet_end - now).total_seconds()) + 1)
+            if last_known:
+                self._set_polling_interval(quiet_interval)
+                self.last_update_time = now
+                _LOGGER.debug("Quiet hours: skipping RTT poll until %s", quiet_end.isoformat())
+                return last_known
+            _LOGGER.debug("Quiet hours: fetching once because there is no data yet")
+            target_interval = quiet_interval
+        else:
+            target_interval = self.peak_interval if self._is_peak(now) else self.off_peak_interval
+        target_interval = self._budget_interval(now, target_interval)
         self._set_polling_interval(target_interval)
 
         self.last_update_time = now
+        self._prune_journey_cache(now)
 
-        try:
-            result_data = {}
-            for query in self.queries:
+        # Each query is fetched and kept on its own: one failed call (often a
+        # rate limit hit part-way through a poll) must not throw away the
+        # fresh results of the queries that did succeed.
+        previous = getattr(self, "data", None) or {}
+        result_data: dict[str, Any] = {}
+        failures: list[RealtimeTrainsApiError] = []
+        rate_limit_err: RealtimeTrainsApiRateLimitError | None = None
+
+        for query in self.queries:
+            query_key = self._query_key(query)
+            try:
                 query_key, query_result = await self._fetch_one_query(query, now)
-                result_data[query_key] = query_result
-        except RealtimeTrainsApiAuthError as err:
-            raise ConfigEntryAuthFailed(err) from err
-        except RealtimeTrainsApiRateLimitError as err:
-            backoff = err.retry_after if (err.retry_after is not None and err.retry_after > 0) else 60
+            except RealtimeTrainsApiAuthError as err:
+                raise ConfigEntryAuthFailed(err) from err
+            except RealtimeTrainsApiError as err:
+                failures.append(err)
+                if isinstance(err, RealtimeTrainsApiRateLimitError) and rate_limit_err is None:
+                    rate_limit_err = err
+                last_known = previous.get(query_key)
+                if last_known is not None:
+                    result_data[query_key] = {**last_known, "data_stale": True}
+                continue
+            except Exception as err:
+                raise UpdateFailed(f"Unexpected error: {err}") from err
+
+            query_result["data_stale"] = False
+            query_result["last_successful_update"] = now.isoformat()
+            result_data[query_key] = query_result
+
+        if rate_limit_err is not None:
+            backoff = (
+                rate_limit_err.retry_after
+                if (rate_limit_err.retry_after is not None and rate_limit_err.retry_after > 0)
+                else 60
+            )
             self._set_polling_interval(max(self.current_polling_interval, backoff))
-            stale = self._serve_stale_data(f"Rate limit hit: {err}")
-            if stale is not None:
-                return stale
-            raise UpdateFailed(f"Rate limit hit: {err}") from err
-        except RealtimeTrainsApiError as err:
-            stale = self._serve_stale_data(f"Error communicating with API: {err}")
-            if stale is not None:
-                return stale
-            raise UpdateFailed(f"Error communicating with API: {err}") from err
-        except Exception as err:
-            raise UpdateFailed(f"Unexpected error: {err}") from err
+
+        if failures:
+            reason = (
+                f"Rate limit hit: {rate_limit_err}"
+                if rate_limit_err is not None
+                else f"Error communicating with API: {failures[0]}"
+            )
+            if not result_data:
+                raise UpdateFailed(reason) from failures[0]
+            self.data_stale = True
+            _LOGGER.warning(
+                "%s of %s queries could not be refreshed; serving last-known data for them: %s",
+                len(failures),
+                len(self.queries),
+                reason,
+            )
+            return result_data
 
         self.data_stale = False
         self.last_successful_update = now
@@ -627,12 +907,3 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._set_polling_interval(max(NO_TRAINS_BACKOFF_SECONDS, target_interval))
 
         return result_data
-
-    def _serve_stale_data(self, reason: str) -> dict[str, Any] | None:
-        """Return the last-known data marked stale, or None when there is none."""
-        last_known = getattr(self, "data", None)
-        if not last_known:
-            return None
-        self.data_stale = True
-        _LOGGER.warning("Serving last-known train data: %s", reason)
-        return last_known

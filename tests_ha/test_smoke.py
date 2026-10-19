@@ -11,12 +11,17 @@ conftest's directory on purpose and runs as its own CI job:
 """
 from __future__ import annotations
 
+from datetime import timedelta
 import re
 
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 DOMAIN = "realtime_trains_api"
 
@@ -94,5 +99,44 @@ async def test_config_entry_sets_up_sensors(
     assert rate_limit is not None
 
     # And it unloads cleanly
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_setup_polls_api_only_once(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    """Adding the entities must not trigger extra refreshes of the coordinator.
+
+    The first refresh already has data; asking each entity to update before
+    being added used to fire one immediate and one debounced refresh on top,
+    tripling the RTT calls on every start or reload.
+    """
+    aioclient_mock.get(LOCATION_URL, json=SERVICES_RESPONSE)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "token": "test-token",
+            "refresh_token": "test-refresh-token",
+            "queries": [
+                {"origin": "DFD", "destination": "CST", "pinned_departure_time": "12:00"}
+            ],
+            "peak_interval": 3600,
+            "off_peak_interval": 3600,
+            "peak_windows": "00:00-23:59",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # Let any debounced refresh (10 s cooldown) fire
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=30))
+    await hass.async_block_till_done()
+
+    assert aioclient_mock.call_count == 1
+
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

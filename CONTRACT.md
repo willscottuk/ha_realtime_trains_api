@@ -94,6 +94,8 @@ The sensor **state** is the integer minutes until the next matching departure, o
 | `journey_duration_minutes` | integer \| null | Total journey duration from origin to destination in minutes |
 | `stops_count` | integer \| null | Intermediate stops count between origin and destination |
 | `disruption_reason` | string \| null | Disruption explanation text when provided by operator |
+| `journey_data_updated_at` | ISO datetime string \| undefined | When the journey details above (arrival, stops, calling points, position) were fetched; present only on enriched trains. They are cached between polls, so this can be several minutes old |
+| `journey_data_stale` | boolean \| undefined | Present on enriched trains; `true` when a refresh of the journey details was due but failed, so cached values are being shown |
 | `last_report_station` | string \| null | Station code of the last actual report |
 | `last_report_type` | string \| null | Last report type: `"Arrival"` \| `"Departure"` \| `"Pass"` |
 | `last_report_time` | ISO datetime string \| null | Timestamp of last report |

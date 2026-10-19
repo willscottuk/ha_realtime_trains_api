@@ -22,6 +22,8 @@ async def test_diagnostics_redacts_tokens(hass, config_entry):
     coordinator.last_update_time = None
     coordinator.last_successful_update = None
     coordinator.last_update_success = True
+    coordinator.budget_limited = False
+    coordinator.estimated_calls_per_poll = 4.5
     coordinator.api.rate_limits = {"minute": {"limit": 60, "remaining": 59}}
     coordinator.data = {
         "DFD_CST_all_0": {
@@ -41,6 +43,8 @@ async def test_diagnostics_redacts_tokens(hass, config_entry):
     assert diagnostics["queries"][0]["train_count"] == 1
     assert diagnostics["queries"][0]["state"] == 4
     assert diagnostics["rate_limits"]["minute"]["remaining"] == 59
+    assert diagnostics["coordinator"]["estimated_calls_per_poll"] == 4.5
+    assert diagnostics["coordinator"]["budget_limited"] is False
 
 
 @pytest.mark.asyncio

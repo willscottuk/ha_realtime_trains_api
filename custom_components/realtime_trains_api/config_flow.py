@@ -24,9 +24,11 @@ from .const import (
     CONF_PEAK_INTERVAL,
     CONF_OFF_PEAK_INTERVAL,
     CONF_PEAK_WINDOWS,
+    CONF_QUIET_HOURS,
     DEFAULT_PEAK_INTERVAL,
     DEFAULT_OFF_PEAK_INTERVAL,
     DEFAULT_PEAK_WINDOWS,
+    DEFAULT_QUIET_HOURS,
     CONF_START,
     CONF_TIMEOFFSET,
     CRS_CODE_PATTERN,
@@ -71,6 +73,7 @@ def _user_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             vol.Optional(CONF_PEAK_INTERVAL, default=defaults.get(CONF_PEAK_INTERVAL, DEFAULT_PEAK_INTERVAL)): vol.All(vol.Coerce(int), vol.Range(min=30, max=3600)),
             vol.Optional(CONF_OFF_PEAK_INTERVAL, default=defaults.get(CONF_OFF_PEAK_INTERVAL, DEFAULT_OFF_PEAK_INTERVAL)): vol.All(vol.Coerce(int), vol.Range(min=30, max=21600)),
             vol.Optional(CONF_PEAK_WINDOWS, default=defaults.get(CONF_PEAK_WINDOWS, DEFAULT_PEAK_WINDOWS)): cv.string,
+            vol.Optional(CONF_QUIET_HOURS, default=defaults.get(CONF_QUIET_HOURS, DEFAULT_QUIET_HOURS)): cv.string,
         }
     )
 
@@ -255,6 +258,10 @@ class RealtimeTrainsConfigFlow(config_entries.ConfigFlow):
                 parse_time_windows(user_input.get(CONF_PEAK_WINDOWS, ""))
             except ValueError:
                 errors[CONF_PEAK_WINDOWS] = "invalid_time_windows"
+            try:
+                parse_time_windows(user_input.get(CONF_QUIET_HOURS, ""), allow_overnight=True)
+            except ValueError:
+                errors[CONF_QUIET_HOURS] = "invalid_time_windows"
 
             if not errors:
                 try:
@@ -383,6 +390,10 @@ class RealtimeTrainsOptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_PEAK_WINDOWS,
                 config_entry.data.get(CONF_PEAK_WINDOWS, DEFAULT_PEAK_WINDOWS),
             ),
+            CONF_QUIET_HOURS: config_entry.options.get(
+                CONF_QUIET_HOURS,
+                config_entry.data.get(CONF_QUIET_HOURS, DEFAULT_QUIET_HOURS),
+            ),
         }
         self._edit_index: int | None = None
 
@@ -408,6 +419,7 @@ class RealtimeTrainsOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(CONF_PEAK_INTERVAL, default=self._settings[CONF_PEAK_INTERVAL]): vol.All(vol.Coerce(int), vol.Range(min=30, max=3600)),
                 vol.Optional(CONF_OFF_PEAK_INTERVAL, default=self._settings[CONF_OFF_PEAK_INTERVAL]): vol.All(vol.Coerce(int), vol.Range(min=30, max=21600)),
                 vol.Optional(CONF_PEAK_WINDOWS, default=self._settings[CONF_PEAK_WINDOWS]): cv.string,
+                vol.Optional(CONF_QUIET_HOURS, default=self._settings[CONF_QUIET_HOURS]): cv.string,
             }
         )
 
@@ -428,6 +440,10 @@ class RealtimeTrainsOptionsFlowHandler(config_entries.OptionsFlow):
                 parse_time_windows(user_input.get(CONF_PEAK_WINDOWS, ""))
             except ValueError:
                 errors[CONF_PEAK_WINDOWS] = "invalid_time_windows"
+            try:
+                parse_time_windows(user_input.get(CONF_QUIET_HOURS, ""), allow_overnight=True)
+            except ValueError:
+                errors[CONF_QUIET_HOURS] = "invalid_time_windows"
 
             if not errors:
                 self._settings = {
@@ -438,6 +454,7 @@ class RealtimeTrainsOptionsFlowHandler(config_entries.OptionsFlow):
                     CONF_PEAK_INTERVAL: int(user_input.get(CONF_PEAK_INTERVAL, DEFAULT_PEAK_INTERVAL)),
                     CONF_OFF_PEAK_INTERVAL: int(user_input.get(CONF_OFF_PEAK_INTERVAL, DEFAULT_OFF_PEAK_INTERVAL)),
                     CONF_PEAK_WINDOWS: user_input.get(CONF_PEAK_WINDOWS, ""),
+                    CONF_QUIET_HOURS: user_input.get(CONF_QUIET_HOURS, ""),
                 }
                 return await self.async_step_init()
 

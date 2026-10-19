@@ -78,7 +78,7 @@ async def test_coordinator_rate_limit_error_fallback_and_stale_data():
     coordinator.data = {"WAL_WAT_all_0": {"next_trains": []}}
 
     data = await coordinator._async_update_data()
-    assert data == {"WAL_WAT_all_0": {"next_trains": []}}
+    assert data == {"WAL_WAT_all_0": {"next_trains": [], "data_stale": True}}
     assert coordinator.data_stale is True
     assert coordinator.current_polling_interval == 60
     assert coordinator.update_interval == timedelta(seconds=60)
@@ -338,9 +338,86 @@ async def test_stale_data_served_on_rate_limit():
     with freeze_time("2026-04-07 12:01:00"):
         stale = await coordinator._async_update_data()
 
-    assert stale is good_data
+    assert stale == {
+        key: {**value, "data_stale": True} for key, value in good_data.items()
+    }
+    assert stale["WAL_WAT_all_0"]["last_successful_update"] == (
+        good_data["WAL_WAT_all_0"]["last_successful_update"]
+    )
     assert coordinator.data_stale is True
     assert coordinator.last_successful_update is not None
+
+
+@pytest.mark.asyncio
+async def test_one_failed_query_keeps_fresh_results_of_the_others():
+    """A failure part-way through a poll must not discard the queries that worked."""
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": [_service("S1")]})
+
+    queries = [
+        {"origin": "WAL", "destination": "WAT"},
+        {"origin": "WAL", "destination": "CLJ"},
+    ]
+    coordinator = _make_coordinator(api, queries)
+
+    with freeze_time("2026-04-07 12:00:00"):
+        coordinator.data = await coordinator._async_update_data()
+
+    async def second_query_rate_limited(origin, destination, *args, **kwargs):
+        if destination == "CLJ":
+            raise RealtimeTrainsApiRateLimitError("Rate limit", retry_after=600)
+        return {"services": [_service("S2", "2026-04-07T12:10:00Z")]}
+
+    api.fetch_location_services = AsyncMock(side_effect=second_query_rate_limited)
+    with freeze_time("2026-04-07 12:01:00"):
+        data = await coordinator._async_update_data()
+
+    fresh = data["WAL_WAT_all_0"]
+    assert fresh["data_stale"] is False
+    assert [t["service_uid"] for t in fresh["next_trains"]] == ["S2"]
+    assert fresh["last_successful_update"].startswith("2026-04-07T13:01")
+
+    stale = data["WAL_CLJ_all_0"]
+    assert stale["data_stale"] is True
+    assert [t["service_uid"] for t in stale["next_trains"]] == ["S1"]
+
+    assert coordinator.data_stale is True
+    assert coordinator.current_polling_interval == 600
+
+
+@pytest.mark.asyncio
+async def test_failed_query_without_previous_data_is_omitted():
+    api = MagicMock()
+
+    async def first_query_fails(origin, destination, *args, **kwargs):
+        if destination == "WAT":
+            raise RealtimeTrainsApiError("boom")
+        return {"services": [_service("S1")]}
+
+    api.fetch_location_services = AsyncMock(side_effect=first_query_fails)
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}, {"origin": "WAL", "destination": "CLJ"}],
+    )
+
+    with freeze_time("2026-04-07 12:00:00"):
+        data = await coordinator._async_update_data()
+
+    assert set(data) == {"WAL_CLJ_all_0"}
+    assert coordinator.data_stale is True
+
+
+@pytest.mark.asyncio
+async def test_all_queries_failing_without_previous_data_raises():
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(side_effect=RealtimeTrainsApiError("boom"))
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}, {"origin": "WAL", "destination": "CLJ"}],
+    )
+
+    with freeze_time("2026-04-07 12:00:00"), pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
 
 
 @pytest.mark.asyncio
@@ -596,3 +673,331 @@ async def test_coordinator_merges_disruptions_and_empty_board_numeric_none():
     assert result["station_messages"] == ["Station announcement 1"]
     assert len(result["disruptions"]) == 1
     assert result["disruptions"][0]["id"] == "D1"
+
+
+def _service_details(uid: str) -> dict:
+    return {
+        "service": {
+            "locations": [
+                {
+                    "location": {"shortCodes": ["WAL"]},
+                    "temporalData": {
+                        "displayAs": "ORIGIN",
+                        "departure": {"scheduleAdvertised": "2026-04-07T12:05:00Z"},
+                    },
+                },
+                {
+                    "location": {"shortCodes": ["WAT"]},
+                    "temporalData": {
+                        "displayAs": "DEST",
+                        "arrival": {"scheduleAdvertised": f"2026-04-07T12:{30 if uid == 'S1' else 40}:00Z"},
+                    },
+                },
+            ]
+        }
+    }
+
+
+def _journey_cache_coordinator(services, journey_data=2):
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": services})
+    api.fetch_service_details = AsyncMock(side_effect=lambda uid, run_date: _service_details(uid))
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT", "journey_data_for_next_X_trains": journey_data, "max_trains": 5}],
+    )
+    return api, coordinator
+
+
+@pytest.mark.asyncio
+async def test_journey_data_is_cached_between_polls():
+    api, coordinator = _journey_cache_coordinator(
+        [_service("S1"), _service("S2", "2026-04-07T12:15:00Z")]
+    )
+
+    with freeze_time("2026-04-07 12:00:00"):
+        await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+    with freeze_time("2026-04-07 12:01:00"):
+        data = await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+    trains = data["WAL_WAT_all_0"]["next_trains"]
+    assert trains[0]["destination_arrival_time"] == "12:30"
+    assert trains[1]["destination_arrival_time"] == "12:40"
+    # Served from cache within its refresh policy: not stale, with its age
+    assert trains[0]["journey_data_stale"] is False
+    assert datetime.fromisoformat(trains[0]["journey_data_updated_at"]) == datetime(
+        2026, 4, 7, 12, 0, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.asyncio
+async def test_only_next_departure_is_refreshed_after_ttl():
+    api, coordinator = _journey_cache_coordinator(
+        [_service("S1"), _service("S2", "2026-04-07T12:15:00Z")]
+    )
+
+    with freeze_time("2026-04-07 11:50:00"):
+        await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+    with freeze_time("2026-04-07 12:01:00"):
+        await coordinator._async_update_data()
+    refreshed = [c.args[0] for c in api.fetch_service_details.call_args_list[2:]]
+    assert refreshed == ["S1"]
+
+
+@pytest.mark.asyncio
+async def test_next_departure_not_refreshed_while_far_off():
+    api, coordinator = _journey_cache_coordinator(
+        [_service("S1", "2026-04-07T13:00:00Z")], journey_data=1
+    )
+
+    with freeze_time("2026-04-07 12:00:00"):
+        await coordinator._async_update_data()
+    with freeze_time("2026-04-07 12:20:00"):
+        await coordinator._async_update_data()
+    # Leaves in 40 minutes: outside the refresh window, so still cached
+    assert api.fetch_service_details.call_count == 1
+
+    with freeze_time("2026-04-07 12:40:00"):
+        await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_falls_back_to_cached_journey_data():
+    api, coordinator = _journey_cache_coordinator([_service("S1")], journey_data=1)
+
+    with freeze_time("2026-04-07 11:50:00"):
+        await coordinator._async_update_data()
+
+    api.fetch_service_details = AsyncMock(
+        side_effect=RealtimeTrainsApiRateLimitError("Rate limit", retry_after=60)
+    )
+    with freeze_time("2026-04-07 12:01:00"):
+        data = await coordinator._async_update_data()
+
+    result = data["WAL_WAT_all_0"]
+    assert api.fetch_service_details.call_count == 1
+    # The board itself is fine; the cached arrival is served but flagged
+    assert result["error"] is None
+    train = result["next_trains"][0]
+    assert train["destination_arrival_time"] == "12:30"
+    assert train["journey_data_stale"] is True
+    assert datetime.fromisoformat(train["journey_data_updated_at"]) == datetime(
+        2026, 4, 7, 11, 50, tzinfo=timezone.utc
+    )
+
+    # A later successful refresh clears the flag
+    api.fetch_service_details = AsyncMock(
+        side_effect=lambda uid, run_date: _service_details(uid)
+    )
+    with freeze_time("2026-04-07 12:02:00"):
+        data = await coordinator._async_update_data()
+    train = data["WAL_WAT_all_0"]["next_trains"][0]
+    assert train["journey_data_stale"] is False
+    assert datetime.fromisoformat(train["journey_data_updated_at"]) == datetime(
+        2026, 4, 7, 12, 2, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.asyncio
+async def test_journey_cache_drops_old_entries():
+    api, coordinator = _journey_cache_coordinator([_service("S1")], journey_data=1)
+
+    with freeze_time("2026-04-07 12:00:00"):
+        await coordinator._async_update_data()
+    assert coordinator._journey_cache
+
+    api.fetch_location_services = AsyncMock(return_value={"services": []})
+    with freeze_time("2026-04-07 16:30:00"):
+        await coordinator._async_update_data()
+    assert not coordinator._journey_cache
+
+
+@pytest.mark.asyncio
+async def test_disruption_reason_comes_from_location_lineup():
+    service = _service("S1")
+    service["reasons"] = [{"type": "DELAY", "shortText": "Signalling fault"}]
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": [service]})
+    api.fetch_service_details = AsyncMock()
+
+    coordinator = _make_coordinator(api, [{"origin": "WAL", "destination": "WAT"}])
+    with freeze_time("2026-04-07 12:00:00"):
+        data = await coordinator._async_update_data()
+
+    assert data["WAL_WAT_all_0"]["next_trains"][0]["disruption_reason"] == "Signalling fault"
+    api.fetch_service_details.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_quiet_hours_skip_api_calls_until_window_ends():
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": [_service("S1")]})
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}],
+        quiet_windows=[(time(23, 30), time(5, 30))],
+    )
+
+    # Intentional exception: a start or reload in quiet hours with no data
+    # yet fetches once, then waits for the window to end
+    with freeze_time("2026-04-07 23:00:00"):  # 00:00 BST
+        coordinator.data = await coordinator._async_update_data()
+    assert api.fetch_location_services.call_count == 1
+    assert coordinator.current_polling_interval == int(timedelta(hours=5, minutes=30).total_seconds()) + 1
+
+    with freeze_time("2026-04-07 23:10:00"):  # 00:10 BST
+        data = await coordinator._async_update_data()
+    assert api.fetch_location_services.call_count == 1
+    assert data is coordinator.data
+    # Next poll lands when the window ends at 05:30 BST
+    assert coordinator.current_polling_interval == int(timedelta(hours=5, minutes=20).total_seconds()) + 1
+
+    with freeze_time("2026-04-08 04:30:00"):  # 05:30 BST
+        await coordinator._async_update_data()
+    assert api.fetch_location_services.call_count == 2
+    assert coordinator.current_polling_interval == 60
+
+
+def test_quiet_window_end():
+    coordinator = _make_coordinator(
+        MagicMock(),
+        [],
+        quiet_windows=[(time(1, 0), time(5, 0)), (time(23, 0), time(0, 30))],
+    )
+    def at(hh, mm):
+        return datetime(2026, 4, 7, hh, mm, tzinfo=TIMEZONE)
+
+    assert coordinator._quiet_window_end(at(12, 0)) is None
+    assert coordinator._quiet_window_end(at(5, 0)) is None
+    assert coordinator._quiet_window_end(at(1, 0)) == at(5, 0)
+    assert coordinator._quiet_window_end(at(23, 15)) == at(0, 30) + timedelta(days=1)
+    assert coordinator._quiet_window_end(at(0, 10)) == at(0, 30)
+
+def _budget_coordinator(hour, day, calls_per_poll=4, peak_windows=None):
+    api = MagicMock()
+    api.request_count = 0
+    api.rate_limits = {
+        "minute": {"limit": 10, "remaining": 10},
+        "hour": {"limit": 100, "remaining": hour},
+        "day": {"limit": 1000, "remaining": day},
+        "week": {"limit": 10000, "remaining": 9000},
+    }
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}],
+        peak_interval=60,
+        off_peak_interval=300,
+        peak_windows=peak_windows or [],
+    )
+    coordinator._calls_per_poll = float(calls_per_poll)
+    return api, coordinator
+
+
+def test_budget_leaves_interval_alone_when_affordable():
+    api, coordinator = _budget_coordinator(hour=100, day=1000, calls_per_poll=1, peak_windows=[(time(7, 0), time(8, 0))])
+    now = datetime(2026, 4, 7, 22, 0, tzinfo=TIMEZONE)  # 21:00 UTC, off-peak
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # 3 h to the day reset at 12 polls/h = 36 calls; hour = 12 calls
+    assert coordinator._budget_interval(now, 300) == 300
+    assert coordinator.budget_limited is False
+
+
+def test_budget_stretches_interval_to_fit_the_hour():
+    api, coordinator = _budget_coordinator(hour=95, day=1000, calls_per_poll=4)
+    now = datetime(2026, 4, 7, 22, 0, tzinfo=TIMEZONE)  # 21:00 UTC: an hour to go
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # 60 polls x 4 calls = 240 wanted, 90 usable (5 held back) -> 160 s
+    assert coordinator._budget_interval(now, 60) == 160
+    assert coordinator.budget_limited is True
+
+
+def test_budget_waits_for_reset_when_exhausted():
+    api, coordinator = _budget_coordinator(hour=3, day=1000, calls_per_poll=4)
+    now = datetime(2026, 4, 7, 22, 40, tzinfo=TIMEZONE)  # 21:40 UTC
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    assert coordinator._budget_interval(now, 60) == 20 * 60 + 1
+
+
+def test_budget_ignores_counters_from_an_earlier_window():
+    api, coordinator = _budget_coordinator(hour=0, day=1000, calls_per_poll=1)
+    now = datetime(2026, 4, 7, 22, 5, tzinfo=TIMEZONE)  # 21:05 UTC
+    # Last heard from the API at 20:59 UTC: the hourly counter has reset since
+    api.rate_limits_updated_at = datetime(2026, 4, 7, 20, 59, tzinfo=timezone.utc)
+
+    assert coordinator._budget_interval(now, 300) == 300
+
+
+def test_budget_stretches_for_the_day_keeping_peak_faster():
+    api, coordinator = _budget_coordinator(
+        hour=100, day=400, calls_per_poll=4, peak_windows=[(time(7, 0), time(9, 0))]
+    )
+    now = datetime(2026, 4, 7, 2, 0, tzinfo=TIMEZONE)  # 01:00 UTC, 23 h to reset
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # Planned: 2 h of peak at 60 polls/h + 21 h off-peak at 12/h = 372 polls,
+    # x4 calls = 1488 wanted vs 350 usable -> every interval x4.25
+    assert coordinator._budget_interval(now, 300) == pytest.approx(1275, abs=5)
+    assert coordinator._budget_interval(now, 60) == pytest.approx(255, abs=2)
+
+
+@pytest.mark.asyncio
+async def test_calls_per_poll_is_measured_from_the_client():
+    api = MagicMock()
+    api.request_count = 0
+    coordinator = _make_coordinator(
+        api, [{"origin": "WAL", "destination": "WAT", "journey_data_for_next_X_trains": 3}]
+    )
+
+    # Before anything is measured, assume every lookup happens
+    assert coordinator._estimate_calls_per_poll() == 4
+    api.request_count = 2
+    assert coordinator._estimate_calls_per_poll() == 2
+    api.request_count = 6
+    # A bigger poll (cache misses) is taken at face value, not averaged
+    assert coordinator._estimate_calls_per_poll() == 4
+    api.request_count = 8
+    # A smaller one only pulls the estimate down gradually
+    assert coordinator._estimate_calls_per_poll() == 3
+    assert coordinator.estimated_calls_per_poll == 3
+
+
+def test_budget_reserves_a_worst_case_poll_for_cache_misses():
+    api, coordinator = _budget_coordinator(hour=20, day=1000, calls_per_poll=4)
+    # Cached enrichment keeps the average at 4, but if all 13 enriched
+    # trains missed the cache at once a poll would make 14 calls
+    coordinator.queries = [
+        {"origin": "WAL", "destination": "WAT", "journey_data_for_next_X_trains": 13}
+    ]
+    now = datetime(2026, 4, 7, 22, 40, tzinfo=TIMEZONE)  # 21:40 UTC
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # 20 left - 14 held back = 6 usable, enough for one average poll: polls
+    # are spaced out, and the worst case never overruns the hour
+    interval = coordinator._budget_interval(now, 60)
+    assert 60 < interval <= 20 * 60 + 1
+    assert coordinator.budget_limited is True
+
+    # With 17 left only 3 are usable, less than an average poll: wait for reset
+    api.rate_limits["hour"]["remaining"] = 17
+    assert coordinator._budget_interval(now, 60) == 20 * 60 + 1
+
+
+def test_budget_does_not_plan_polls_in_quiet_hours():
+    api, coordinator = _budget_coordinator(hour=100, day=400, calls_per_poll=4)
+    now = datetime(2026, 4, 7, 2, 0, tzinfo=TIMEZONE)  # 01:00 UTC, 23 h to reset
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+    without_quiet = coordinator._budget_interval(now, 300)
+
+    coordinator.quiet_windows = [(time(0, 30), time(6, 0)), (time(22, 0), time(23, 59))]
+    with_quiet = coordinator._budget_interval(now, 300)
+
+    # Fewer planned polls means each one can come sooner
+    assert 300 < with_quiet < without_quiet

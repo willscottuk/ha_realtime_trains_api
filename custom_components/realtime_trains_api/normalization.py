@@ -77,8 +77,13 @@ def coerce_time_offset(value: Any, default: timedelta) -> timedelta:
     return default
 
 
-def parse_time_windows(windows_str: str) -> list[tuple[time, time]]:
-    """Parse a comma-separated string of time windows (e.g., '07:00-09:30, 16:30-19:00')."""
+def parse_time_windows(
+    windows_str: str, allow_overnight: bool = False
+) -> list[tuple[time, time]]:
+    """Parse a comma-separated string of time windows (e.g., '07:00-09:30, 16:30-19:00').
+
+    With allow_overnight, a window may wrap past midnight (e.g. '23:30-05:30').
+    """
     if not windows_str or not windows_str.strip():
         return []
 
@@ -89,7 +94,7 @@ def parse_time_windows(windows_str: str) -> list[tuple[time, time]]:
             start_str, end_str = part.split("-")
             start_time = datetime.strptime(start_str.strip(), "%H:%M").time()
             end_time = datetime.strptime(end_str.strip(), "%H:%M").time()
-            if end_time <= start_time:
+            if end_time == start_time or (end_time < start_time and not allow_overnight):
                 raise ValueError(f"End time {end_time} must be after start time {start_time}")
             windows.append((start_time, end_time))
         except ValueError as err:

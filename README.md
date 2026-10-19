@@ -100,7 +100,12 @@ doesn't cover).
 Each sensor exposes attributes a dashboard can use to judge how fresh the data is:
 
 - `current_polling_interval` / `next_update_at` — the active polling cadence and when the next refresh is due.
+- Polling paces itself to your RTT rate limits: requests are spaced to stay within the per-minute limit, and if your peak/off-peak intervals would spend more than the hourly or daily budget left, every interval is stretched by the same factor until the budget resets (`current_polling_interval` shows the result; diagnostics include `budget_limited` and `estimated_calls_per_poll`). Enough of each budget is held back for one worst-case poll, where every enriched train misses the journey cache. The hourly and daily budgets come from the API's own counters, so they include calls made with the same token elsewhere (for example the blueprint or another Home Assistant). The per-minute spacing also honours the remaining count the API last reported, so calls from before a restart or from other clients slow it down too. Just after a restart it can't know about those until the first response comes back, so the very first request can still hit a rate-limit pause.
 - `data_stale` / `last_successful_update` — when the RTT API is down or rate-limited, the integration keeps serving the last-known departures (instead of the sensor going unavailable) and sets `data_stale: true` so a card can show a "last-known data" indicator.
+
+### Quiet hours
+
+Set **Quiet hours** in the integration's polling settings (for example `00:30-05:30`, or `23:30-05:30` across midnight) to stop calling the RTT API overnight. During quiet hours sensors keep their last values and the next poll is scheduled for the end of the window. The one exception is starting or reloading Home Assistant during quiet hours: with no data yet, the integration fetches once so the sensors aren't unavailable all night, then waits for the window to end. Empty by default, so polling stays around the clock unless you set it. This saves a large share of a daily rate-limit budget.
 
 ### Diagnostics
 
@@ -126,6 +131,10 @@ sensor:
         # (WAL in this case) to destination (WAT in this case) will hit 
         # the API to lookup the number of stops, journey time and estimated
         # arrival time to the destination (WAT in this case).
+        # Each train is looked up once when it first appears; after that
+        # only the next departure is re-checked (every 10 minutes, once it
+        # leaves within 30 minutes), so this costs far fewer API calls than
+        # one per train per poll.
         journey_data_for_next_X_trains: 5
       - origin: WAT
         destination: WAL

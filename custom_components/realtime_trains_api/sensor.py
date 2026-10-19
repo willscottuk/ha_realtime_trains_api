@@ -230,7 +230,7 @@ async def async_setup_platform(
     sensors.append(RealtimeTrainRateLimitSensor(coordinator, None))
 
     if sensors:
-        async_add_entities(sensors, True)
+        async_add_entities(sensors)
 
 
 async def async_setup_entry(
@@ -296,7 +296,7 @@ async def async_setup_entry(
     sensors.append(RealtimeTrainRateLimitSensor(coordinator, entry.entry_id))
 
     if sensors:
-        async_add_entities(sensors, True)
+        async_add_entities(sensors)
     else:
         _LOGGER.warning(
             "Realtime Trains API entry %s produced no sensors after validation", entry.entry_id
@@ -380,6 +380,17 @@ class RealtimeTrainLiveTrainTimeSensor(CoordinatorEntity, SensorEntity):
             self._attr_unique_id = None
 
     @property
+    def available(self) -> bool:
+        """Report unavailable while this query has never fetched successfully.
+
+        Queries refresh independently, so another query's success can leave
+        this one with no data at all; that must not read as an empty board.
+        """
+        if not getattr(super(), "available", True):
+            return False
+        return self._query_key in (getattr(self.coordinator, "data", None) or {})
+
+    @property
     def native_value(self):
         """Return the state of the sensor."""
         coord_data = getattr(self.coordinator, "data", None)
@@ -447,6 +458,13 @@ class RealtimeTrainLiveTrainTimeSensor(CoordinatorEntity, SensorEntity):
         attrs[ATTR_DATA_STALE] = bool(getattr(self.coordinator, "data_stale", False))
         if getattr(self.coordinator, "last_successful_update", None):
             attrs[ATTR_LAST_SUCCESSFUL_UPDATE] = self.coordinator.last_successful_update.isoformat()
+
+        # Queries refresh independently, so prefer this query's own freshness
+        query_data = (coord_data or {}).get(self._query_key) or {}
+        if "data_stale" in query_data:
+            attrs[ATTR_DATA_STALE] = bool(query_data["data_stale"])
+        if query_data.get("last_successful_update"):
+            attrs[ATTR_LAST_SUCCESSFUL_UPDATE] = query_data["last_successful_update"]
 
         return attrs
 

@@ -211,7 +211,7 @@ async def test_setup_entry_creates_sensor_only_for_pinned_queries(hass, config_e
     }
 
     added = []
-    async_setup = lambda entities, update: added.extend(entities)
+    async_setup = lambda entities, update_before_add=False: added.extend(entities)
     await async_setup_entry(hass, config_entry, async_setup)
 
     assert len(added) == 1

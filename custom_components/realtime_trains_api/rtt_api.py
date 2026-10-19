@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+import asyncio
+from collections import deque
+from datetime import date, datetime, timezone
 import logging
+import time
 from typing import Any
 
 from aiohttp import ClientSession
@@ -44,6 +47,14 @@ class RealtimeTrainsApiClient:
             "week": {"limit": None, "remaining": None},
         }
         self._retry_after_timestamp: float | None = None
+        # When the rate_limits above were last read from a response (UTC)
+        self.rate_limits_updated_at: datetime | None = None
+        # Total requests sent, so callers can measure what a poll costs
+        self.request_count = 0
+        self._recent_requests: deque[float] = deque()
+        # (monotonic time, X-RateLimit-Remaining-Minute) from the last response
+        self._minute_remaining_reading: tuple[float, int] | None = None
+        self._pacing_lock = asyncio.Lock()
 
     @property
     def token(self) -> str:
@@ -126,8 +137,52 @@ class RealtimeTrainsApiClient:
         path = f"gb-nr/service?identity={service_uid}&departureDate={run_date.isoformat()}"
         return await self._request(path)
 
+    def _minute_wait_from_server(self, now: float) -> float:
+        """Seconds to wait because the API reported the minute budget spent.
+
+        The account's X-RateLimit-Remaining-Minute also counts requests this
+        client never saw (from before a restart, or other clients using the
+        same token). Requests sent since that reading are taken off it, and
+        when nothing is left we wait a full minute from the reading, which
+        covers either a fixed or a sliding window.
+        """
+        if self._minute_remaining_reading is None:
+            return 0.0
+        read_at, remaining = self._minute_remaining_reading
+        age = now - read_at
+        if age >= 60:
+            return 0.0
+        sent_since = sum(1 for sent_at in self._recent_requests if sent_at > read_at)
+        if remaining - sent_since > 0:
+            return 0.0
+        return 60 - age + 0.5
+
+    async def _wait_for_minute_budget(self) -> None:
+        """Space requests so a burst never exceeds the per-minute limit.
+
+        Keeps a sliding 60 s window of this client's own requests, sized from
+        the X-RateLimit-Limit-Minute header once one has been seen, and also
+        honours the remaining count the API last reported for the account.
+        """
+        async with self._pacing_lock:
+            limit = self.rate_limits["minute"]["limit"]
+            while True:
+                now = time.monotonic()
+                while self._recent_requests and now - self._recent_requests[0] >= 60:
+                    self._recent_requests.popleft()
+                delay = self._minute_wait_from_server(now)
+                if limit and len(self._recent_requests) >= limit:
+                    delay = max(delay, 60 - (now - self._recent_requests[0]) + 0.5)
+                if delay <= 0:
+                    break
+                _LOGGER.debug(
+                    "Pacing RTT requests: waiting %.1f s to stay within the per-minute limit",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            self._recent_requests.append(time.monotonic())
+
     async def _request(self, path: str) -> dict[str, Any]:
-        import time
         url = f"{API_BASE}{path}"
         
         # Check if we should preemptively skip
@@ -136,11 +191,18 @@ class RealtimeTrainsApiClient:
                 "Waiting for rate limit reset based on Retry-After header",
                 retry_after=int(self._retry_after_timestamp - time.time())
             )
-            
+
+        await self._wait_for_minute_budget()
+        self.request_count += 1
 
         try:
             async with self._session.get(url, headers=self._headers) as response:
                 # Parse Rate Limit Headers
+                if any(
+                    response.headers.get(f"X-RateLimit-Remaining-{dim}") is not None
+                    for dim in ("Minute", "Hour", "Day", "Week")
+                ):
+                    self.rate_limits_updated_at = datetime.now(timezone.utc)
                 for dim in ["Minute", "Hour", "Day", "Week"]:
                     limit_header = response.headers.get(f"X-RateLimit-Limit-{dim}")
                     remaining_header = response.headers.get(f"X-RateLimit-Remaining-{dim}")
@@ -154,6 +216,12 @@ class RealtimeTrainsApiClient:
                             self.rate_limits[dim.lower()]["remaining"] = int(remaining_header)
                         except ValueError:
                             pass
+                        else:
+                            if dim == "Minute":
+                                self._minute_remaining_reading = (
+                                    time.monotonic(),
+                                    int(remaining_header),
+                                )
 
                 if response.status == 200:
                     return await response.json()
