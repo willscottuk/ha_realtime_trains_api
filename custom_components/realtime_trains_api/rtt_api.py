@@ -52,6 +52,8 @@ class RealtimeTrainsApiClient:
         # Total requests sent, so callers can measure what a poll costs
         self.request_count = 0
         self._recent_requests: deque[float] = deque()
+        # (monotonic time, X-RateLimit-Remaining-Minute) from the last response
+        self._minute_remaining_reading: tuple[float, int] | None = None
         self._pacing_lock = asyncio.Lock()
 
     @property
@@ -135,12 +137,32 @@ class RealtimeTrainsApiClient:
         path = f"gb-nr/service?identity={service_uid}&departureDate={run_date.isoformat()}"
         return await self._request(path)
 
+    def _minute_wait_from_server(self, now: float) -> float:
+        """Seconds to wait because the API reported the minute budget spent.
+
+        The account's X-RateLimit-Remaining-Minute also counts requests this
+        client never saw (from before a restart, or other clients using the
+        same token). Requests sent since that reading are taken off it, and
+        when nothing is left we wait a full minute from the reading, which
+        covers either a fixed or a sliding window.
+        """
+        if self._minute_remaining_reading is None:
+            return 0.0
+        read_at, remaining = self._minute_remaining_reading
+        age = now - read_at
+        if age >= 60:
+            return 0.0
+        sent_since = sum(1 for sent_at in self._recent_requests if sent_at > read_at)
+        if remaining - sent_since > 0:
+            return 0.0
+        return 60 - age + 0.5
+
     async def _wait_for_minute_budget(self) -> None:
         """Space requests so a burst never exceeds the per-minute limit.
 
         Keeps a sliding 60 s window of this client's own requests, sized from
-        the X-RateLimit-Limit-Minute header once one has been seen. A sliding
-        window is at least as strict as the API's per-minute window.
+        the X-RateLimit-Limit-Minute header once one has been seen, and also
+        honours the remaining count the API last reported for the account.
         """
         async with self._pacing_lock:
             limit = self.rate_limits["minute"]["limit"]
@@ -148,13 +170,14 @@ class RealtimeTrainsApiClient:
                 now = time.monotonic()
                 while self._recent_requests and now - self._recent_requests[0] >= 60:
                     self._recent_requests.popleft()
-                if not limit or len(self._recent_requests) < limit:
+                delay = self._minute_wait_from_server(now)
+                if limit and len(self._recent_requests) >= limit:
+                    delay = max(delay, 60 - (now - self._recent_requests[0]) + 0.5)
+                if delay <= 0:
                     break
-                delay = 60 - (now - self._recent_requests[0]) + 0.5
                 _LOGGER.debug(
-                    "Pacing RTT requests: waiting %.1f s to stay within %s/minute",
+                    "Pacing RTT requests: waiting %.1f s to stay within the per-minute limit",
                     delay,
-                    limit,
                 )
                 await asyncio.sleep(delay)
             self._recent_requests.append(time.monotonic())
@@ -193,6 +216,12 @@ class RealtimeTrainsApiClient:
                             self.rate_limits[dim.lower()]["remaining"] = int(remaining_header)
                         except ValueError:
                             pass
+                        else:
+                            if dim == "Minute":
+                                self._minute_remaining_reading = (
+                                    time.monotonic(),
+                                    int(remaining_header),
+                                )
 
                 if response.status == 200:
                     return await response.json()
