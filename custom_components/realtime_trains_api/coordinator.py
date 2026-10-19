@@ -154,6 +154,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cache_key = (train['service_uid'], scheduled_departure.date().isoformat())
         data, due = self._cached_journey_data(cache_key, now, may_refresh)
 
+        refresh_failed = False
         if due:
             try:
                 fetched = await retry_with_auth_refresh(
@@ -167,18 +168,22 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except RealtimeTrainsApiAuthError:
                 if data is None:
                     return "Credentials invalid"
+                refresh_failed = True
             except RealtimeTrainsApiRateLimitError as err:
                 _LOGGER.debug("Rate limit hit or preemptively skipped for journey data: %s", err)
                 if data is None:
                     return "Rate Limited"
+                refresh_failed = True
             except RealtimeTrainsApiNotFoundError:
                 _LOGGER.debug("Could not find %s in stops for service %s.", journey_end, train['service_uid'])
                 if data is None:
                     return None
+                refresh_failed = True
             except RealtimeTrainsApiError as err:
                 _LOGGER.debug("Could not populate arrival times: %s", err)
                 if data is None:
                     return None
+                refresh_failed = True
             else:
                 if fetched is not None:
                     self._journey_cache[cache_key] = (now, fetched)
@@ -186,6 +191,12 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if data is None:
             return None
+
+        # Arrival and position come from cached service details, so say how
+        # old they are, and flag them when a refresh that was due failed.
+        fetched_at = self._journey_cache[cache_key][0]
+        train["journey_data_updated_at"] = fetched_at.isoformat()
+        train["journey_data_stale"] = refresh_failed
 
         service = data.get("service", {})
         locations = service.get("locations", [])

@@ -726,6 +726,11 @@ async def test_journey_data_is_cached_between_polls():
     trains = data["WAL_WAT_all_0"]["next_trains"]
     assert trains[0]["destination_arrival_time"] == "12:30"
     assert trains[1]["destination_arrival_time"] == "12:40"
+    # Served from cache within its refresh policy: not stale, with its age
+    assert trains[0]["journey_data_stale"] is False
+    assert datetime.fromisoformat(trains[0]["journey_data_updated_at"]) == datetime(
+        2026, 4, 7, 12, 0, tzinfo=timezone.utc
+    )
 
 
 @pytest.mark.asyncio
@@ -777,8 +782,26 @@ async def test_failed_refresh_falls_back_to_cached_journey_data():
 
     result = data["WAL_WAT_all_0"]
     assert api.fetch_service_details.call_count == 1
+    # The board itself is fine; the cached arrival is served but flagged
     assert result["error"] is None
-    assert result["next_trains"][0]["destination_arrival_time"] == "12:30"
+    train = result["next_trains"][0]
+    assert train["destination_arrival_time"] == "12:30"
+    assert train["journey_data_stale"] is True
+    assert datetime.fromisoformat(train["journey_data_updated_at"]) == datetime(
+        2026, 4, 7, 11, 50, tzinfo=timezone.utc
+    )
+
+    # A later successful refresh clears the flag
+    api.fetch_service_details = AsyncMock(
+        side_effect=lambda uid, run_date: _service_details(uid)
+    )
+    with freeze_time("2026-04-07 12:02:00"):
+        data = await coordinator._async_update_data()
+    train = data["WAL_WAT_all_0"]["next_trains"][0]
+    assert train["journey_data_stale"] is False
+    assert datetime.fromisoformat(train["journey_data_updated_at"]) == datetime(
+        2026, 4, 7, 12, 2, tzinfo=timezone.utc
+    )
 
 
 @pytest.mark.asyncio
