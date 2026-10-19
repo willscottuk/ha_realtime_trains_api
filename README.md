@@ -100,6 +100,7 @@ doesn't cover).
 Each sensor exposes attributes a dashboard can use to judge how fresh the data is:
 
 - `current_polling_interval` / `next_update_at` — the active polling cadence and when the next refresh is due.
+- Polling paces itself to your RTT rate limits: requests are spaced to stay within the per-minute limit, and if your peak/off-peak intervals would spend more than the hourly or daily budget left, every interval is stretched by the same factor until the budget resets (`current_polling_interval` shows the result; diagnostics include `budget_limited` and `estimated_calls_per_poll`).
 - `data_stale` / `last_successful_update` — when the RTT API is down or rate-limited, the integration keeps serving the last-known departures (instead of the sensor going unavailable) and sets `data_stale: true` so a card can show a "last-known data" indicator.
 
 ### Quiet hours

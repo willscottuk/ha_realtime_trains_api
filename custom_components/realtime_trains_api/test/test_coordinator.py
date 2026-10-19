@@ -877,3 +877,102 @@ def test_quiet_window_end():
     assert coordinator._quiet_window_end(at(1, 0)) == at(5, 0)
     assert coordinator._quiet_window_end(at(23, 15)) == at(0, 30) + timedelta(days=1)
     assert coordinator._quiet_window_end(at(0, 10)) == at(0, 30)
+
+def _budget_coordinator(hour, day, calls_per_poll=4, peak_windows=None):
+    api = MagicMock()
+    api.request_count = 0
+    api.rate_limits = {
+        "minute": {"limit": 10, "remaining": 10},
+        "hour": {"limit": 100, "remaining": hour},
+        "day": {"limit": 1000, "remaining": day},
+        "week": {"limit": 10000, "remaining": 9000},
+    }
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}],
+        peak_interval=60,
+        off_peak_interval=300,
+        peak_windows=peak_windows or [],
+    )
+    coordinator._calls_per_poll = float(calls_per_poll)
+    return api, coordinator
+
+
+def test_budget_leaves_interval_alone_when_affordable():
+    api, coordinator = _budget_coordinator(hour=100, day=1000, calls_per_poll=1, peak_windows=[(time(7, 0), time(8, 0))])
+    now = datetime(2026, 4, 7, 22, 0, tzinfo=TIMEZONE)  # 21:00 UTC, off-peak
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # 3 h to the day reset at 12 polls/h = 36 calls; hour = 12 calls
+    assert coordinator._budget_interval(now, 300) == 300
+    assert coordinator.budget_limited is False
+
+
+def test_budget_stretches_interval_to_fit_the_hour():
+    api, coordinator = _budget_coordinator(hour=95, day=1000, calls_per_poll=4)
+    now = datetime(2026, 4, 7, 22, 0, tzinfo=TIMEZONE)  # 21:00 UTC: an hour to go
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # 60 polls x 4 calls = 240 wanted, 90 usable (5 held back) -> 160 s
+    assert coordinator._budget_interval(now, 60) == 160
+    assert coordinator.budget_limited is True
+
+
+def test_budget_waits_for_reset_when_exhausted():
+    api, coordinator = _budget_coordinator(hour=3, day=1000, calls_per_poll=4)
+    now = datetime(2026, 4, 7, 22, 40, tzinfo=TIMEZONE)  # 21:40 UTC
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    assert coordinator._budget_interval(now, 60) == 20 * 60 + 1
+
+
+def test_budget_ignores_counters_from_an_earlier_window():
+    api, coordinator = _budget_coordinator(hour=0, day=1000, calls_per_poll=1)
+    now = datetime(2026, 4, 7, 22, 5, tzinfo=TIMEZONE)  # 21:05 UTC
+    # Last heard from the API at 20:59 UTC: the hourly counter has reset since
+    api.rate_limits_updated_at = datetime(2026, 4, 7, 20, 59, tzinfo=timezone.utc)
+
+    assert coordinator._budget_interval(now, 300) == 300
+
+
+def test_budget_stretches_for_the_day_keeping_peak_faster():
+    api, coordinator = _budget_coordinator(
+        hour=100, day=400, calls_per_poll=4, peak_windows=[(time(7, 0), time(9, 0))]
+    )
+    now = datetime(2026, 4, 7, 2, 0, tzinfo=TIMEZONE)  # 01:00 UTC, 23 h to reset
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # Planned: 2 h of peak at 60 polls/h + 21 h off-peak at 12/h = 372 polls,
+    # x4 calls = 1488 wanted vs 350 usable -> every interval x4.25
+    assert coordinator._budget_interval(now, 300) == pytest.approx(1275, abs=5)
+    assert coordinator._budget_interval(now, 60) == pytest.approx(255, abs=2)
+
+
+@pytest.mark.asyncio
+async def test_calls_per_poll_is_measured_from_the_client():
+    api = MagicMock()
+    api.request_count = 0
+    coordinator = _make_coordinator(
+        api, [{"origin": "WAL", "destination": "WAT", "journey_data_for_next_X_trains": 3}]
+    )
+
+    # Before anything is measured, assume every lookup happens
+    assert coordinator._estimate_calls_per_poll() == 4
+    api.request_count = 2
+    assert coordinator._estimate_calls_per_poll() == 2
+    api.request_count = 6
+    assert coordinator._estimate_calls_per_poll() == 3
+    assert coordinator.estimated_calls_per_poll == 3
+
+
+def test_budget_does_not_plan_polls_in_quiet_hours():
+    api, coordinator = _budget_coordinator(hour=100, day=400, calls_per_poll=4)
+    now = datetime(2026, 4, 7, 2, 0, tzinfo=TIMEZONE)  # 01:00 UTC, 23 h to reset
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+    without_quiet = coordinator._budget_interval(now, 300)
+
+    coordinator.quiet_windows = [(time(0, 30), time(6, 0)), (time(22, 0), time(23, 59))]
+    with_quiet = coordinator._budget_interval(now, 300)
+
+    # Fewer planned polls means each one can come sooner
+    assert 300 < with_quiet < without_quiet

@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -254,3 +255,56 @@ async def test_rate_limit_deadlock(sample_departures: dict) -> None:
     # Request 2 should succeed and update limits, but will fail if preemptively blocked
     await client.fetch_location_services("BKH", "CST")
     assert client.rate_limits["minute"]["remaining"] == 29
+
+
+@pytest.mark.asyncio
+async def test_requests_are_counted_and_limits_timestamped(sample_departures: dict) -> None:
+    session = MockSession()
+    url = f"{API_BASE}gb-nr/location?code=BKH&filterTo=CST"
+    session.queue_response(
+        url,
+        MockResponse(200, json_data=sample_departures, headers={"X-RateLimit-Remaining-Hour": "99"}),
+    )
+    client = RealtimeTrainsApiClient(session, "token123")
+    assert client.rate_limits_updated_at is None
+
+    await client.fetch_location_services("BKH", "CST")
+    await client.fetch_location_services("BKH", "CST")
+
+    assert client.request_count == 2
+    assert client.rate_limits_updated_at is not None
+
+
+@pytest.mark.asyncio
+async def test_requests_are_paced_to_the_minute_limit(sample_departures: dict) -> None:
+    session = MockSession()
+    url = f"{API_BASE}gb-nr/location?code=BKH&filterTo=CST"
+    session.queue_response(
+        url,
+        MockResponse(200, json_data=sample_departures, headers={"X-RateLimit-Limit-Minute": "3"}),
+    )
+    client = RealtimeTrainsApiClient(session, "token123")
+
+    clock = {"now": 1000.0}
+
+    async def fake_sleep(seconds):
+        clock["now"] += seconds
+
+    with patch(
+        "custom_components.realtime_trains_api.rtt_api.time.monotonic",
+        side_effect=lambda: clock["now"],
+    ), patch(
+        "custom_components.realtime_trains_api.rtt_api.asyncio.sleep",
+        AsyncMock(side_effect=fake_sleep),
+    ) as sleep:
+        for _ in range(3):
+            await client.fetch_location_services("BKH", "CST")
+            clock["now"] += 1
+        sleep.assert_not_called()
+
+        # Fourth request inside the same minute waits for the oldest to age out
+        await client.fetch_location_services("BKH", "CST")
+
+    sleep.assert_awaited_once()
+    assert sleep.await_args.args[0] == pytest.approx(57.5)
+    assert len(session.calls) == 4

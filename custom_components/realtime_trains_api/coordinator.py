@@ -1,6 +1,7 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
+import math
 import re
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -62,6 +63,10 @@ JOURNEY_DATA_REFRESH_WINDOW_MINUTES = 30
 # Cached entries for trains that are long gone are dropped after this long.
 JOURNEY_DATA_CACHE_MAX_AGE = timedelta(hours=4)
 
+# Share of each hourly/daily rate-limit budget held back for restarts and
+# manual refreshes when pacing polls.
+RATE_LIMIT_RESERVE_FRACTION = 0.05
+
 def _delta_seconds(hhmm_datetime_a: datetime, hhmm_datetime_b: datetime) -> float:
     a_trunc = hhmm_datetime_a.replace(second=0, microsecond=0)
     b_trunc = hhmm_datetime_b.replace(second=0, microsecond=0)
@@ -106,6 +111,10 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.data_stale = False
         self._station_name_cache: dict[str, str] = {}
         self._journey_cache: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
+
+        self._calls_per_poll: float | None = None
+        self._request_count_at_last_poll: int | None = None
+        self.budget_limited = False
 
     async def _async_refresh_token(self) -> bool:
         """Refresh the access token."""
@@ -319,6 +328,101 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     end_dt += timedelta(days=1)
                 return end_dt
         return None
+
+    @property
+    def estimated_calls_per_poll(self) -> float | None:
+        """Measured average API calls per poll, once known."""
+        return round(self._calls_per_poll, 1) if self._calls_per_poll is not None else None
+
+    def _estimate_calls_per_poll(self) -> float:
+        """Update and return the average number of API calls a poll makes."""
+        count = getattr(self.api, "request_count", None)
+        if isinstance(count, int) and not isinstance(count, bool):
+            if self._request_count_at_last_poll is not None:
+                made = count - self._request_count_at_last_poll
+                if made > 0:
+                    self._calls_per_poll = (
+                        float(made)
+                        if self._calls_per_poll is None
+                        else (self._calls_per_poll + made) / 2
+                    )
+            self._request_count_at_last_poll = count
+
+        if self._calls_per_poll is not None:
+            return self._calls_per_poll
+        # Nothing measured yet: assume the worst case of every lookup
+        return float(
+            sum(1 + (query.get(CONF_JOURNEYDATA, 0) or 0) for query in self.queries) or 1
+        )
+
+    def _planned_polls(self, now: datetime, until: datetime) -> float:
+        """Polls the configured schedule would make before `until` (none in quiet hours)."""
+        polls = 0.0
+        step = timedelta(minutes=1)
+        moment = now
+        while moment < until:
+            if self._quiet_window_end(moment) is not None:
+                moment += step
+                continue
+            interval = self.peak_interval if self._is_peak(moment) else self.off_peak_interval
+            polls += 60 / max(interval, 1)
+            moment += step
+        return polls
+
+    def _budget_interval(self, now: datetime, target_interval: int) -> int:
+        """Return a polling interval that keeps the hourly and daily budgets.
+
+        Reads the X-RateLimit-* values from the last response. If the
+        configured schedule would spend more than what's left before a
+        window resets, every interval is stretched by the same factor so
+        peak polling stays proportionally faster than off-peak. The hour
+        window resets on the clock hour and the day window at 00:00 UTC
+        (as observed from the API's counters).
+        """
+        calls_per_poll = self._estimate_calls_per_poll()
+        rate_limits = getattr(self.api, "rate_limits", None)
+        updated_at = getattr(self.api, "rate_limits_updated_at", None)
+        if not isinstance(rate_limits, dict) or not isinstance(updated_at, datetime):
+            self.budget_limited = False
+            return target_interval
+
+        now_utc = now.astimezone(timezone.utc)
+        interval = float(target_interval)
+
+        windows = {
+            "hour": (now_utc.replace(minute=0, second=0, microsecond=0), timedelta(hours=1)),
+            "day": (now_utc.replace(hour=0, minute=0, second=0, microsecond=0), timedelta(days=1)),
+        }
+        for name, (window_start, length) in windows.items():
+            counts = rate_limits.get(name) or {}
+            limit = counts.get("limit")
+            remaining = counts.get("remaining")
+            if not isinstance(limit, int) or not isinstance(remaining, int) or limit <= 0:
+                continue
+            if updated_at < window_start:
+                remaining = limit  # the window has reset since we last heard
+            reset_at = window_start + length
+            seconds_left = (reset_at - now_utc).total_seconds()
+            usable = remaining - max(1, math.ceil(limit * RATE_LIMIT_RESERVE_FRACTION))
+
+            if usable < calls_per_poll:
+                interval = max(interval, seconds_left + 1)
+                continue
+
+            planned = self._planned_polls(now, reset_at.astimezone(now.tzinfo or TIMEZONE))
+            if planned * calls_per_poll > usable:
+                stretched = target_interval * planned * calls_per_poll / usable
+                interval = max(interval, min(stretched, seconds_left + 1))
+
+        self.budget_limited = interval > target_interval
+        if self.budget_limited:
+            _LOGGER.debug(
+                "Pacing polls to the RTT rate limit: %s s instead of %s s (~%.1f calls per poll)",
+                int(interval),
+                target_interval,
+                calls_per_poll,
+            )
+        return max(target_interval, int(math.ceil(interval)))
 
     def _set_polling_interval(self, seconds: int) -> None:
         if self.current_polling_interval != seconds:
@@ -724,6 +828,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             target_interval = quiet_interval
         else:
             target_interval = self.peak_interval if self._is_peak(now) else self.off_peak_interval
+        target_interval = self._budget_interval(now, target_interval)
         self._set_polling_interval(target_interval)
 
         self.last_update_time = now

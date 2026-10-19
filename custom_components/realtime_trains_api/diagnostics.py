@@ -55,6 +55,8 @@ async def async_get_config_entry_diagnostics(
         "last_update_time": _isoformat(coordinator.last_update_time),
         "last_successful_update": _isoformat(coordinator.last_successful_update),
         "last_update_success": getattr(coordinator, "last_update_success", None),
+        "budget_limited": coordinator.budget_limited,
+        "estimated_calls_per_poll": coordinator.estimated_calls_per_poll,
     }
     diagnostics["rate_limits"] = coordinator.api.rate_limits
 
