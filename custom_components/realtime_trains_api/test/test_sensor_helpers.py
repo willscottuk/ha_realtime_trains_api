@@ -283,6 +283,51 @@ def test_sensor_unrecorded_attributes_and_empty_next_trains():
     attrs = sensor.extra_state_attributes
     assert attrs[ATTR_DATA_STALE] is False
     assert attrs[ATTR_LAST_SUCCESSFUL_UPDATE] == "2026-04-07T12:00:00+01:00"
+    assert sensor.available is True
+
+
+def test_sensor_unavailable_when_its_query_has_no_data():
+    """A query that has never fetched shows unavailable, not an empty board."""
+    from unittest.mock import MagicMock
+    from custom_components.realtime_trains_api.binary_sensor import (
+        RealtimeTrainPinnedDisruptionSensor,
+    )
+    from custom_components.realtime_trains_api.sensor import (
+        RealtimeTrainLiveTrainTimeSensor,
+    )
+
+    coordinator = MagicMock()
+    # Another query succeeded; this one failed before it ever had data
+    coordinator.data = {"ECR_VIC_all_0_0": {"next_trains": [], "state": 5}}
+
+    sensor = RealtimeTrainLiveTrainTimeSensor(
+        coordinator=coordinator,
+        sensor_name=None,
+        query_key="WIM_VXH_all_0_0",
+        journey_start="WIM",
+        journey_end="VXH",
+        timeoffset=timedelta(),
+        platforms_of_interest=[],
+        entry_id="test_entry",
+        query_index=1,
+    )
+    assert sensor.available is False
+    assert sensor.native_value is None
+
+    pinned = RealtimeTrainPinnedDisruptionSensor(
+        coordinator=coordinator,
+        query_key="WIM_VXH_all_0_0",
+        origin="WIM",
+        destination="VXH",
+        pinned_time="08:15",
+        entry_id="test_entry",
+        query_index=1,
+    )
+    assert pinned.available is False
+
+    coordinator.data["WIM_VXH_all_0_0"] = {"next_trains": [], "state": 3}
+    assert sensor.available is True
+    assert pinned.available is True
 
 
 def test_calculate_service_status_cases() -> None:

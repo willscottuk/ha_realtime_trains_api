@@ -100,6 +100,13 @@ class RealtimeTrainPinnedDisruptionSensor(CoordinatorEntity, BinarySensorEntity)
         self._attr_name = f"Your {pinned_time} from {origin}{destination_str} disrupted"
         self._attr_unique_id = f"{entry_id}_{query_key}_{pinned_time}_pinned_{query_index}"
 
+    @property
+    def available(self) -> bool:
+        """Report unavailable while the pinned train's query has no data."""
+        if not getattr(super(), "available", True):
+            return False
+        return self._query_key in (self.coordinator.data or {})
+
     def _pinned_train(self) -> dict | None:
         data = self.coordinator.data or {}
         result = data.get(self._query_key)
