@@ -961,8 +961,33 @@ async def test_calls_per_poll_is_measured_from_the_client():
     api.request_count = 2
     assert coordinator._estimate_calls_per_poll() == 2
     api.request_count = 6
+    # A bigger poll (cache misses) is taken at face value, not averaged
+    assert coordinator._estimate_calls_per_poll() == 4
+    api.request_count = 8
+    # A smaller one only pulls the estimate down gradually
     assert coordinator._estimate_calls_per_poll() == 3
     assert coordinator.estimated_calls_per_poll == 3
+
+
+def test_budget_reserves_a_worst_case_poll_for_cache_misses():
+    api, coordinator = _budget_coordinator(hour=20, day=1000, calls_per_poll=4)
+    # Cached enrichment keeps the average at 4, but if all 13 enriched
+    # trains missed the cache at once a poll would make 14 calls
+    coordinator.queries = [
+        {"origin": "WAL", "destination": "WAT", "journey_data_for_next_X_trains": 13}
+    ]
+    now = datetime(2026, 4, 7, 22, 40, tzinfo=TIMEZONE)  # 21:40 UTC
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # 20 left - 14 held back = 6 usable, enough for one average poll: polls
+    # are spaced out, and the worst case never overruns the hour
+    interval = coordinator._budget_interval(now, 60)
+    assert 60 < interval <= 20 * 60 + 1
+    assert coordinator.budget_limited is True
+
+    # With 17 left only 3 are usable, less than an average poll: wait for reset
+    api.rate_limits["hour"]["remaining"] = 17
+    assert coordinator._budget_interval(now, 60) == 20 * 60 + 1
 
 
 def test_budget_does_not_plan_polls_in_quiet_hours():

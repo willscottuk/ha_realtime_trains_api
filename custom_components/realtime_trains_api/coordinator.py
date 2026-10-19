@@ -341,9 +341,11 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._request_count_at_last_poll is not None:
                 made = count - self._request_count_at_last_poll
                 if made > 0:
+                    # Rise straight to a bigger poll, decay slowly from one,
+                    # so a burst of new trains isn't averaged away
                     self._calls_per_poll = (
                         float(made)
-                        if self._calls_per_poll is None
+                        if self._calls_per_poll is None or made > self._calls_per_poll
                         else (self._calls_per_poll + made) / 2
                     )
             self._request_count_at_last_poll = count
@@ -351,9 +353,12 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._calls_per_poll is not None:
             return self._calls_per_poll
         # Nothing measured yet: assume the worst case of every lookup
-        return float(
-            sum(1 + (query.get(CONF_JOURNEYDATA, 0) or 0) for query in self.queries) or 1
-        )
+        return float(self._max_calls_per_poll())
+
+    def _max_calls_per_poll(self) -> int:
+        """Most calls one poll can make: every location lookup plus every
+        enrichment missing the journey cache at once."""
+        return sum(1 + (query.get(CONF_JOURNEYDATA, 0) or 0) for query in self.queries) or 1
 
     def _planned_polls(self, now: datetime, until: datetime) -> float:
         """Polls the configured schedule would make before `until` (none in quiet hours)."""
@@ -388,6 +393,9 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         now_utc = now.astimezone(timezone.utc)
         interval = float(target_interval)
+        # Hold back enough for one worst-case poll on top of the average, so
+        # a poll where every enriched train misses the cache still fits
+        worst_case = max(self._max_calls_per_poll(), math.ceil(calls_per_poll))
 
         windows = {
             "hour": (now_utc.replace(minute=0, second=0, microsecond=0), timedelta(hours=1)),
@@ -403,7 +411,8 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 remaining = limit  # the window has reset since we last heard
             reset_at = window_start + length
             seconds_left = (reset_at - now_utc).total_seconds()
-            usable = remaining - max(1, math.ceil(limit * RATE_LIMIT_RESERVE_FRACTION))
+            reserve = max(math.ceil(limit * RATE_LIMIT_RESERVE_FRACTION), worst_case)
+            usable = remaining - reserve
 
             if usable < calls_per_poll:
                 interval = max(interval, seconds_left + 1)
