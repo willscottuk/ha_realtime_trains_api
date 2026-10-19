@@ -843,10 +843,12 @@ async def test_quiet_hours_skip_api_calls_until_window_ends():
         quiet_windows=[(time(23, 30), time(5, 30))],
     )
 
-    # The first refresh runs even in quiet hours, so sensors start with data
+    # Intentional exception: a start or reload in quiet hours with no data
+    # yet fetches once, then waits for the window to end
     with freeze_time("2026-04-07 23:00:00"):  # 00:00 BST
         coordinator.data = await coordinator._async_update_data()
     assert api.fetch_location_services.call_count == 1
+    assert coordinator.current_polling_interval == int(timedelta(hours=5, minutes=30).total_seconds()) + 1
 
     with freeze_time("2026-04-07 23:10:00"):  # 00:10 BST
         data = await coordinator._async_update_data()

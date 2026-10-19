@@ -104,7 +104,7 @@ Each sensor exposes attributes a dashboard can use to judge how fresh the data i
 
 ### Quiet hours
 
-Set **Quiet hours** in the integration's polling settings (for example `00:30-05:30`, or `23:30-05:30` across midnight) to stop calling the RTT API overnight. During quiet hours sensors keep their last values and the next poll is scheduled for the end of the window. Empty by default, so polling stays around the clock unless you set it. This saves a large share of a daily rate-limit budget.
+Set **Quiet hours** in the integration's polling settings (for example `00:30-05:30`, or `23:30-05:30` across midnight) to stop calling the RTT API overnight. During quiet hours sensors keep their last values and the next poll is scheduled for the end of the window. The one exception is starting or reloading Home Assistant during quiet hours: with no data yet, the integration fetches once so the sensors aren't unavailable all night, then waits for the window to end. Empty by default, so polling stays around the clock unless you set it. This saves a large share of a daily rate-limit budget.
 
 ### Diagnostics
 

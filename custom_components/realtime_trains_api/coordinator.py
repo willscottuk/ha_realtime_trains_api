@@ -707,18 +707,23 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Fetch data from API endpoint."""
         now = cast(datetime, dt_util.now()).astimezone(TIMEZONE)
 
-        # During quiet hours the API isn't called at all: sensors keep their
-        # last values and the next poll is scheduled for when the window ends.
-        # The very first refresh still runs so sensors start with data.
+        # During quiet hours the API isn't called and sensors keep their last
+        # values. The one exception is a start or reload with no data yet:
+        # that single fetch still runs, so sensors aren't unavailable for the
+        # rest of the window. Either way the next poll lands when it ends.
         quiet_end = self._quiet_window_end(now)
         last_known = getattr(self, "data", None)
-        if quiet_end is not None and last_known:
-            self._set_polling_interval(max(60, int((quiet_end - now).total_seconds()) + 1))
-            self.last_update_time = now
-            _LOGGER.debug("Quiet hours: skipping RTT poll until %s", quiet_end.isoformat())
-            return last_known
-
-        target_interval = self.peak_interval if self._is_peak(now) else self.off_peak_interval
+        if quiet_end is not None:
+            quiet_interval = max(60, int((quiet_end - now).total_seconds()) + 1)
+            if last_known:
+                self._set_polling_interval(quiet_interval)
+                self.last_update_time = now
+                _LOGGER.debug("Quiet hours: skipping RTT poll until %s", quiet_end.isoformat())
+                return last_known
+            _LOGGER.debug("Quiet hours: fetching once because there is no data yet")
+            target_interval = quiet_interval
+        else:
+            target_interval = self.peak_interval if self._is_peak(now) else self.off_peak_interval
         self._set_polling_interval(target_interval)
 
         self.last_update_time = now
