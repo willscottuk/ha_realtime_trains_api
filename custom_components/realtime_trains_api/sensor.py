@@ -230,7 +230,7 @@ async def async_setup_platform(
     sensors.append(RealtimeTrainRateLimitSensor(coordinator, None))
 
     if sensors:
-        async_add_entities(sensors, True)
+        async_add_entities(sensors)
 
 
 async def async_setup_entry(
@@ -296,7 +296,7 @@ async def async_setup_entry(
     sensors.append(RealtimeTrainRateLimitSensor(coordinator, entry.entry_id))
 
     if sensors:
-        async_add_entities(sensors, True)
+        async_add_entities(sensors)
     else:
         _LOGGER.warning(
             "Realtime Trains API entry %s produced no sensors after validation", entry.entry_id

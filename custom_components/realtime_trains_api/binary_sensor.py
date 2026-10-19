@@ -73,7 +73,7 @@ async def async_setup_entry(
         )
 
     if sensors:
-        async_add_entities(sensors, True)
+        async_add_entities(sensors)
 
 
 class RealtimeTrainPinnedDisruptionSensor(CoordinatorEntity, BinarySensorEntity):
