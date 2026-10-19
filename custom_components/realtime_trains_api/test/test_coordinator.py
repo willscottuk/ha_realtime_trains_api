@@ -673,3 +673,139 @@ async def test_coordinator_merges_disruptions_and_empty_board_numeric_none():
     assert result["station_messages"] == ["Station announcement 1"]
     assert len(result["disruptions"]) == 1
     assert result["disruptions"][0]["id"] == "D1"
+
+
+def _service_details(uid: str) -> dict:
+    return {
+        "service": {
+            "locations": [
+                {
+                    "location": {"shortCodes": ["WAL"]},
+                    "temporalData": {
+                        "displayAs": "ORIGIN",
+                        "departure": {"scheduleAdvertised": "2026-04-07T12:05:00Z"},
+                    },
+                },
+                {
+                    "location": {"shortCodes": ["WAT"]},
+                    "temporalData": {
+                        "displayAs": "DEST",
+                        "arrival": {"scheduleAdvertised": f"2026-04-07T12:{30 if uid == 'S1' else 40}:00Z"},
+                    },
+                },
+            ]
+        }
+    }
+
+
+def _journey_cache_coordinator(services, journey_data=2):
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": services})
+    api.fetch_service_details = AsyncMock(side_effect=lambda uid, run_date: _service_details(uid))
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT", "journey_data_for_next_X_trains": journey_data, "max_trains": 5}],
+    )
+    return api, coordinator
+
+
+@pytest.mark.asyncio
+async def test_journey_data_is_cached_between_polls():
+    api, coordinator = _journey_cache_coordinator(
+        [_service("S1"), _service("S2", "2026-04-07T12:15:00Z")]
+    )
+
+    with freeze_time("2026-04-07 12:00:00"):
+        await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+    with freeze_time("2026-04-07 12:01:00"):
+        data = await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+    trains = data["WAL_WAT_all_0"]["next_trains"]
+    assert trains[0]["destination_arrival_time"] == "12:30"
+    assert trains[1]["destination_arrival_time"] == "12:40"
+
+
+@pytest.mark.asyncio
+async def test_only_next_departure_is_refreshed_after_ttl():
+    api, coordinator = _journey_cache_coordinator(
+        [_service("S1"), _service("S2", "2026-04-07T12:15:00Z")]
+    )
+
+    with freeze_time("2026-04-07 11:50:00"):
+        await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+    with freeze_time("2026-04-07 12:01:00"):
+        await coordinator._async_update_data()
+    refreshed = [c.args[0] for c in api.fetch_service_details.call_args_list[2:]]
+    assert refreshed == ["S1"]
+
+
+@pytest.mark.asyncio
+async def test_next_departure_not_refreshed_while_far_off():
+    api, coordinator = _journey_cache_coordinator(
+        [_service("S1", "2026-04-07T13:00:00Z")], journey_data=1
+    )
+
+    with freeze_time("2026-04-07 12:00:00"):
+        await coordinator._async_update_data()
+    with freeze_time("2026-04-07 12:20:00"):
+        await coordinator._async_update_data()
+    # Leaves in 40 minutes: outside the refresh window, so still cached
+    assert api.fetch_service_details.call_count == 1
+
+    with freeze_time("2026-04-07 12:40:00"):
+        await coordinator._async_update_data()
+    assert api.fetch_service_details.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_falls_back_to_cached_journey_data():
+    api, coordinator = _journey_cache_coordinator([_service("S1")], journey_data=1)
+
+    with freeze_time("2026-04-07 11:50:00"):
+        await coordinator._async_update_data()
+
+    api.fetch_service_details = AsyncMock(
+        side_effect=RealtimeTrainsApiRateLimitError("Rate limit", retry_after=60)
+    )
+    with freeze_time("2026-04-07 12:01:00"):
+        data = await coordinator._async_update_data()
+
+    result = data["WAL_WAT_all_0"]
+    assert api.fetch_service_details.call_count == 1
+    assert result["error"] is None
+    assert result["next_trains"][0]["destination_arrival_time"] == "12:30"
+
+
+@pytest.mark.asyncio
+async def test_journey_cache_drops_old_entries():
+    api, coordinator = _journey_cache_coordinator([_service("S1")], journey_data=1)
+
+    with freeze_time("2026-04-07 12:00:00"):
+        await coordinator._async_update_data()
+    assert coordinator._journey_cache
+
+    api.fetch_location_services = AsyncMock(return_value={"services": []})
+    with freeze_time("2026-04-07 16:30:00"):
+        await coordinator._async_update_data()
+    assert not coordinator._journey_cache
+
+
+@pytest.mark.asyncio
+async def test_disruption_reason_comes_from_location_lineup():
+    service = _service("S1")
+    service["reasons"] = [{"type": "DELAY", "shortText": "Signalling fault"}]
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": [service]})
+    api.fetch_service_details = AsyncMock()
+
+    coordinator = _make_coordinator(api, [{"origin": "WAL", "destination": "WAT"}])
+    with freeze_time("2026-04-07 12:00:00"):
+        data = await coordinator._async_update_data()
+
+    assert data["WAL_WAT_all_0"]["next_trains"][0]["disruption_reason"] == "Signalling fault"
+    api.fetch_service_details.assert_not_called()

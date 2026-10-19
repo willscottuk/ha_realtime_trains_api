@@ -53,6 +53,15 @@ TIMEZONE = ZoneInfo('Europe/London')
 # per-minute rate budget.
 JOURNEY_DATA_CONCURRENCY = 2
 
+# Journey details are cached per service. A calling pattern doesn't change
+# during the day, so each train is looked up once when it first appears; only
+# the next departure is looked up again (at most this often, and only when it
+# leaves soon) to keep its live position and arrival forecast current.
+JOURNEY_DATA_REFRESH_SECONDS = 600
+JOURNEY_DATA_REFRESH_WINDOW_MINUTES = 30
+# Cached entries for trains that are long gone are dropped after this long.
+JOURNEY_DATA_CACHE_MAX_AGE = timedelta(hours=4)
+
 def _delta_seconds(hhmm_datetime_a: datetime, hhmm_datetime_b: datetime) -> float:
     a_trunc = hhmm_datetime_a.replace(second=0, microsecond=0)
     b_trunc = hhmm_datetime_b.replace(second=0, microsecond=0)
@@ -94,6 +103,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_successful_update: datetime | None = None
         self.data_stale = False
         self._station_name_cache: dict[str, str] = {}
+        self._journey_cache: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
 
     async def _async_refresh_token(self) -> bool:
         """Refresh the access token."""
@@ -104,28 +114,75 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.error("Failed to refresh RTT access token: %s", err)
             return False
 
-    async def _add_journey_data(self, train, scheduled_departure, estimated_departure, journey_start, journey_end):
-        """Populate journey data using service details."""
-        try:
-            data = await retry_with_auth_refresh(
-                lambda: self.api.fetch_service_details(
-                    train['service_uid'],
-                    scheduled_departure,
-                ),
-                self._async_refresh_token,
-                lambda err: _LOGGER.debug("Could not populate arrival times after retry: %s", err),
-            )
-        except RealtimeTrainsApiAuthError:
-            return "Credentials invalid"
-        except RealtimeTrainsApiRateLimitError as err:
-            _LOGGER.debug("Rate limit hit or preemptively skipped for journey data: %s", err)
-            return "Rate Limited"
-        except RealtimeTrainsApiNotFoundError:
-            _LOGGER.debug("Could not find %s in stops for service %s.", journey_end, train['service_uid'])
-            return None
-        except RealtimeTrainsApiError as err:
-            _LOGGER.debug("Could not populate arrival times: %s", err)
-            return None
+    def _cached_journey_data(
+        self, cache_key: tuple[str, str], now: datetime, may_refresh: bool
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Return (cached service details, whether they are due a refresh)."""
+        cached = self._journey_cache.get(cache_key)
+        if cached is None:
+            return None, True
+        fetched_at, data = cached
+        due = (
+            may_refresh
+            and (now - fetched_at).total_seconds() >= JOURNEY_DATA_REFRESH_SECONDS
+        )
+        return data, due
+
+    def _prune_journey_cache(self, now: datetime) -> None:
+        """Forget service details fetched too long ago to still be on a board."""
+        expired = [
+            key
+            for key, (fetched_at, _) in self._journey_cache.items()
+            if now - fetched_at > JOURNEY_DATA_CACHE_MAX_AGE
+        ]
+        for key in expired:
+            del self._journey_cache[key]
+
+    async def _add_journey_data(
+        self,
+        train,
+        scheduled_departure,
+        estimated_departure,
+        journey_start,
+        journey_end,
+        now: datetime | None = None,
+        may_refresh: bool = True,
+    ):
+        """Populate journey data using (cached) service details."""
+        if now is None:
+            now = cast(datetime, dt_util.now()).astimezone(TIMEZONE)
+        cache_key = (train['service_uid'], scheduled_departure.date().isoformat())
+        data, due = self._cached_journey_data(cache_key, now, may_refresh)
+
+        if due:
+            try:
+                fetched = await retry_with_auth_refresh(
+                    lambda: self.api.fetch_service_details(
+                        train['service_uid'],
+                        scheduled_departure,
+                    ),
+                    self._async_refresh_token,
+                    lambda err: _LOGGER.debug("Could not populate arrival times after retry: %s", err),
+                )
+            except RealtimeTrainsApiAuthError:
+                if data is None:
+                    return "Credentials invalid"
+            except RealtimeTrainsApiRateLimitError as err:
+                _LOGGER.debug("Rate limit hit or preemptively skipped for journey data: %s", err)
+                if data is None:
+                    return "Rate Limited"
+            except RealtimeTrainsApiNotFoundError:
+                _LOGGER.debug("Could not find %s in stops for service %s.", journey_end, train['service_uid'])
+                if data is None:
+                    return None
+            except RealtimeTrainsApiError as err:
+                _LOGGER.debug("Could not populate arrival times: %s", err)
+                if data is None:
+                    return None
+            else:
+                if fetched is not None:
+                    self._journey_cache[cache_key] = (now, fetched)
+                    data = fetched
 
         if data is None:
             return None
@@ -328,6 +385,12 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         effective_departure = estimatedTs if estimatedTs is not None else scheduledTs
 
+        # The location line-up already carries delay/cancellation reasons, so
+        # every train gets one for free; journey enrichment may refine it.
+        reasons = departure.get("reasons") or []
+        first_reason = reasons[0] if reasons and isinstance(reasons[0], dict) else {}
+        disruption_reason = first_reason.get("shortText")
+
         return {
             "origin_name": origin_name,
             "destination_name": destination_name,
@@ -358,7 +421,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "destination_delay_minutes": None,
             "journey_duration_minutes": None,
             "stops_count": None,
-            "disruption_reason": None,
+            "disruption_reason": str(disruption_reason) if disruption_reason else None,
             "last_report_station": None,
             "last_report_type": None,
             "last_report_time": None,
@@ -464,7 +527,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Enrichment failures no longer replace the numeric state; they are
         # surfaced separately so the sensor stays usable in automations.
-        error = await self._enrich_journey_data(enrichment, origin, destination)
+        error = await self._enrich_journey_data(enrichment, origin, destination, now)
 
         state = None
         if nextDepartureEstimatedTs is not None:
@@ -574,8 +637,14 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         trains: list[tuple[dict[str, Any], datetime, datetime]],
         origin: str,
         destination: str | None,
+        now: datetime | None = None,
     ) -> str | None:
         """Fetch journey details for the given trains with bounded concurrency.
+
+        Details come from the per-service cache where possible: a train is
+        looked up when first seen, and only the next departure, once it
+        leaves within JOURNEY_DATA_REFRESH_WINDOW_MINUTES, is looked up again
+        after JOURNEY_DATA_REFRESH_SECONDS.
 
         Returns the first error state encountered, if any. _add_journey_data
         swallows API errors into these state strings, so gather cannot raise
@@ -583,17 +652,24 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if not trains:
             return None
+        if now is None:
+            now = cast(datetime, dt_util.now()).astimezone(TIMEZONE)
 
         semaphore = asyncio.Semaphore(JOURNEY_DATA_CONCURRENCY)
+        refresh_window = timedelta(minutes=JOURNEY_DATA_REFRESH_WINDOW_MINUTES)
 
-        async def enrich(train, scheduledTs, estimatedTs):
+        async def enrich(index, train, scheduledTs, estimatedTs):
+            may_refresh = index == 0 and estimatedTs - now <= refresh_window
             async with semaphore:
                 return await self._add_journey_data(
-                    train, scheduledTs, estimatedTs, origin, destination
+                    train, scheduledTs, estimatedTs, origin, destination, now, may_refresh
                 )
 
         results = await asyncio.gather(
-            *(enrich(train, sched, est) for train, sched, est in trains)
+            *(
+                enrich(index, train, sched, est)
+                for index, (train, sched, est) in enumerate(trains)
+            )
         )
         return next((err for err in results if err), None)
 
@@ -605,6 +681,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._set_polling_interval(target_interval)
 
         self.last_update_time = now
+        self._prune_journey_cache(now)
 
         # Each query is fetched and kept on its own: one failed call (often a
         # rate limit hit part-way through a poll) must not throw away the

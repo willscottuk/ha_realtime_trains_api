@@ -126,6 +126,10 @@ sensor:
         # (WAL in this case) to destination (WAT in this case) will hit 
         # the API to lookup the number of stops, journey time and estimated
         # arrival time to the destination (WAT in this case).
+        # Each train is looked up once when it first appears; after that
+        # only the next departure is re-checked (every 10 minutes, once it
+        # leaves within 30 minutes), so this costs far fewer API calls than
+        # one per train per poll.
         journey_data_for_next_X_trains: 5
       - origin: WAT
         destination: WAL
