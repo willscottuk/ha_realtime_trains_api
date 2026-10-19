@@ -209,6 +209,25 @@ async def test_options_settings_then_save_keeps_queries():
     assert result["data"]["auto_adjust_scans"] is True
     assert result["data"]["peak_interval"] == 90
     assert result["data"]["off_peak_interval"] == 600
+    assert result["data"]["quiet_hours"] == ""
+
+
+@pytest.mark.asyncio
+async def test_options_settings_quiet_hours():
+    handler = RealtimeTrainsOptionsFlowHandler(_make_config_entry())
+
+    result = await handler.async_step_settings(
+        {"peak_windows": "07:00-09:00", "quiet_hours": "bad"}
+    )
+    assert result["type"] == "form"
+    assert result["errors"] == {"quiet_hours": "invalid_time_windows"}
+
+    result = await handler.async_step_settings(
+        {"peak_windows": "07:00-09:00", "quiet_hours": "23:30-05:30"}
+    )
+    assert result["type"] == "menu"
+    result = await handler.async_step_save()
+    assert result["data"]["quiet_hours"] == "23:30-05:30"
 
 
 @pytest.mark.asyncio

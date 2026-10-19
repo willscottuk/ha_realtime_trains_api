@@ -21,9 +21,11 @@ from .const import (
     CONF_PEAK_INTERVAL,
     CONF_OFF_PEAK_INTERVAL,
     CONF_PEAK_WINDOWS,
+    CONF_QUIET_HOURS,
     DEFAULT_PEAK_INTERVAL,
     DEFAULT_OFF_PEAK_INTERVAL,
     DEFAULT_PEAK_WINDOWS,
+    DEFAULT_QUIET_HOURS,
     CONF_OPENLDBWS_TOKEN,
     CONF_KB_USERNAME,
     CONF_KB_PASSWORD,
@@ -62,6 +64,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     peak_interval = int(_entry_option(entry, CONF_PEAK_INTERVAL, DEFAULT_PEAK_INTERVAL))
     off_peak_interval = int(_entry_option(entry, CONF_OFF_PEAK_INTERVAL, DEFAULT_OFF_PEAK_INTERVAL))
     peak_windows_str = _entry_option(entry, CONF_PEAK_WINDOWS, DEFAULT_PEAK_WINDOWS)
+    quiet_hours_str = _entry_option(entry, CONF_QUIET_HOURS, DEFAULT_QUIET_HOURS)
     auto_adjust_scans = bool(_entry_option(entry, CONF_AUTOADJUSTSCANS, False))
 
     openldbws_token = _entry_option(entry, CONF_OPENLDBWS_TOKEN)
@@ -91,6 +94,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         peak_windows=parse_time_windows(peak_windows_str),
         auto_adjust_scans=auto_adjust_scans,
         disruption_manager=disruption_manager,
+        quiet_windows=parse_time_windows(quiet_hours_str, allow_overnight=True),
     )
 
     await coordinator.async_config_entry_first_refresh()

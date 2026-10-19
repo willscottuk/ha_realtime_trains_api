@@ -832,3 +832,46 @@ async def test_disruption_reason_comes_from_location_lineup():
 
     assert data["WAL_WAT_all_0"]["next_trains"][0]["disruption_reason"] == "Signalling fault"
     api.fetch_service_details.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_quiet_hours_skip_api_calls_until_window_ends():
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": [_service("S1")]})
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}],
+        quiet_windows=[(time(23, 30), time(5, 30))],
+    )
+
+    # The first refresh runs even in quiet hours, so sensors start with data
+    with freeze_time("2026-04-07 23:00:00"):  # 00:00 BST
+        coordinator.data = await coordinator._async_update_data()
+    assert api.fetch_location_services.call_count == 1
+
+    with freeze_time("2026-04-07 23:10:00"):  # 00:10 BST
+        data = await coordinator._async_update_data()
+    assert api.fetch_location_services.call_count == 1
+    assert data is coordinator.data
+    # Next poll lands when the window ends at 05:30 BST
+    assert coordinator.current_polling_interval == int(timedelta(hours=5, minutes=20).total_seconds()) + 1
+
+    with freeze_time("2026-04-08 04:30:00"):  # 05:30 BST
+        await coordinator._async_update_data()
+    assert api.fetch_location_services.call_count == 2
+    assert coordinator.current_polling_interval == 60
+
+
+def test_quiet_window_end():
+    coordinator = _make_coordinator(
+        MagicMock(),
+        [],
+        quiet_windows=[(time(1, 0), time(5, 0)), (time(23, 0), time(0, 30))],
+    )
+    def at(hh, mm):
+        return datetime(2026, 4, 7, hh, mm, tzinfo=TIMEZONE)
+
+    assert coordinator._quiet_window_end(at(12, 0)) is None
+    assert coordinator._quiet_window_end(at(5, 0)) is None
+    assert coordinator._quiet_window_end(at(1, 0)) == at(5, 0)
+    assert coordinator._quiet_window_end(at(23, 15)) == at(0, 30) + timedelta(days=1)
+    assert coordinator._quiet_window_end(at(0, 10)) == at(0, 30)

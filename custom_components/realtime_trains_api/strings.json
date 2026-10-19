@@ -11,7 +11,8 @@
                     "auto_adjust_scans": "Back off polling while a station has no departures",
                     "peak_interval": "Peak polling interval (seconds)",
                     "off_peak_interval": "Off-peak polling interval (seconds)",
-                    "peak_windows": "Peak time windows (HH:MM-HH:MM, comma separated)"
+                    "peak_windows": "Peak time windows (HH:MM-HH:MM, comma separated)",
+                    "quiet_hours": "Quiet hours with no polling (HH:MM-HH:MM, comma separated, may cross midnight)"
                 }
             },
             "query": {
@@ -70,7 +71,8 @@
                     "auto_adjust_scans": "Back off polling while a station has no departures",
                     "peak_interval": "Peak polling interval (seconds)",
                     "off_peak_interval": "Off-peak polling interval (seconds)",
-                    "peak_windows": "Peak time windows (HH:MM-HH:MM, comma separated)"
+                    "peak_windows": "Peak time windows (HH:MM-HH:MM, comma separated)",
+                    "quiet_hours": "Quiet hours with no polling (HH:MM-HH:MM, comma separated, may cross midnight)"
                 }
             },
             "add_query": {

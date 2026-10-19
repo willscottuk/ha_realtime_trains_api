@@ -102,6 +102,10 @@ Each sensor exposes attributes a dashboard can use to judge how fresh the data i
 - `current_polling_interval` / `next_update_at` — the active polling cadence and when the next refresh is due.
 - `data_stale` / `last_successful_update` — when the RTT API is down or rate-limited, the integration keeps serving the last-known departures (instead of the sensor going unavailable) and sets `data_stale: true` so a card can show a "last-known data" indicator.
 
+### Quiet hours
+
+Set **Quiet hours** in the integration's polling settings (for example `00:30-05:30`, or `23:30-05:30` across midnight) to stop calling the RTT API overnight. During quiet hours sensors keep their last values and the next poll is scheduled for the end of the window. Empty by default, so polling stays around the clock unless you set it. This saves a large share of a daily rate-limit budget.
+
 ### Diagnostics
 
 The integration implements Home Assistant config-entry diagnostics: on the integration page, use "Download diagnostics" to get a redacted bundle (configured queries, polling state, rate-limit budget) for bug reports.

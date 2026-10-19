@@ -28,10 +28,13 @@ PINNED_DELAY_THRESHOLD_MINUTES = 5
 CONF_PEAK_INTERVAL = "peak_interval"
 CONF_OFF_PEAK_INTERVAL = "off_peak_interval"
 CONF_PEAK_WINDOWS = "peak_windows"
+CONF_QUIET_HOURS = "quiet_hours"
 
 DEFAULT_PEAK_INTERVAL = 60
 DEFAULT_OFF_PEAK_INTERVAL = 300
 DEFAULT_PEAK_WINDOWS = "07:00-09:30, 16:00-19:00"
+# No quiet hours unless configured, which keeps polling around the clock
+DEFAULT_QUIET_HOURS = ""
 DEFAULT_LOOKBACK_MINUTES = 60
 DEFAULT_MAX_TRAINS = 10
 

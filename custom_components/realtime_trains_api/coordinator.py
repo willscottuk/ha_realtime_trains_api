@@ -83,6 +83,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         peak_windows: list = None,
         auto_adjust_scans: bool = False,
         disruption_manager: DisruptionManager | None = None,
+        quiet_windows: list | None = None,
     ) -> None:
         """Initialize."""
         super().__init__(
@@ -96,6 +97,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.peak_interval = peak_interval
         self.off_peak_interval = off_peak_interval
         self.peak_windows = peak_windows or []
+        self.quiet_windows = quiet_windows or []
         self.auto_adjust_scans = auto_adjust_scans
         self.disruption_manager = disruption_manager or DisruptionManager()
         self.current_polling_interval = None
@@ -300,6 +302,23 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return True
         current_time = now.time()
         return any(start <= current_time <= end for start, end in self.peak_windows)
+
+    def _quiet_window_end(self, now: datetime) -> datetime | None:
+        """Return when the current quiet window ends, or None outside quiet hours."""
+        current = now.time().replace(tzinfo=None)
+        for start, end in self.quiet_windows:
+            if start < end:
+                inside = start <= current < end
+            else:  # wraps past midnight
+                inside = current >= start or current < end
+            if inside:
+                end_dt = now.replace(
+                    hour=end.hour, minute=end.minute, second=0, microsecond=0
+                )
+                if end_dt <= now:
+                    end_dt += timedelta(days=1)
+                return end_dt
+        return None
 
     def _set_polling_interval(self, seconds: int) -> None:
         if self.current_polling_interval != seconds:
@@ -687,6 +706,17 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from API endpoint."""
         now = cast(datetime, dt_util.now()).astimezone(TIMEZONE)
+
+        # During quiet hours the API isn't called at all: sensors keep their
+        # last values and the next poll is scheduled for when the window ends.
+        # The very first refresh still runs so sensors start with data.
+        quiet_end = self._quiet_window_end(now)
+        last_known = getattr(self, "data", None)
+        if quiet_end is not None and last_known:
+            self._set_polling_interval(max(60, int((quiet_end - now).total_seconds()) + 1))
+            self.last_update_time = now
+            _LOGGER.debug("Quiet hours: skipping RTT poll until %s", quiet_end.isoformat())
+            return last_known
 
         target_interval = self.peak_interval if self._is_peak(now) else self.off_peak_interval
         self._set_polling_interval(target_interval)
