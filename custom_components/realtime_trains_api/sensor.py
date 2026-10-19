@@ -448,6 +448,13 @@ class RealtimeTrainLiveTrainTimeSensor(CoordinatorEntity, SensorEntity):
         if getattr(self.coordinator, "last_successful_update", None):
             attrs[ATTR_LAST_SUCCESSFUL_UPDATE] = self.coordinator.last_successful_update.isoformat()
 
+        # Queries refresh independently, so prefer this query's own freshness
+        query_data = (coord_data or {}).get(self._query_key) or {}
+        if "data_stale" in query_data:
+            attrs[ATTR_DATA_STALE] = bool(query_data["data_stale"])
+        if query_data.get("last_successful_update"):
+            attrs[ATTR_LAST_SUCCESSFUL_UPDATE] = query_data["last_successful_update"]
+
         return attrs
 
 

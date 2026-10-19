@@ -365,6 +365,17 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_report_time_label": None,
         }
 
+    @staticmethod
+    def _query_key(query: dict[str, Any]) -> str:
+        """Return the coordinator data key the sensors use for a query."""
+        platforms = query.get(CONF_PLATFORMS_OF_INTEREST, [])
+        if isinstance(platforms, str):
+            platforms = split_csv(platforms)
+        time_offset = coerce_time_offset(query.get(CONF_TIMEOFFSET, timedelta()), timedelta())
+        return build_query_key(
+            query.get(CONF_START), query.get(CONF_END), set(platforms), time_offset
+        )
+
     async def _fetch_one_query(
         self, query: dict[str, Any], now: datetime
     ) -> tuple[str, dict[str, Any]]:
@@ -388,7 +399,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             platforms = split_csv(platforms)
         platforms_of_interest = set(platforms)
 
-        query_key = build_query_key(origin, destination, platforms_of_interest, time_offset)
+        query_key = self._query_key(query)
 
         _LOGGER.debug(
             "Fetching location services for %s to %s at %s",
@@ -595,27 +606,59 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.last_update_time = now
 
-        try:
-            result_data = {}
-            for query in self.queries:
+        # Each query is fetched and kept on its own: one failed call (often a
+        # rate limit hit part-way through a poll) must not throw away the
+        # fresh results of the queries that did succeed.
+        previous = getattr(self, "data", None) or {}
+        result_data: dict[str, Any] = {}
+        failures: list[RealtimeTrainsApiError] = []
+        rate_limit_err: RealtimeTrainsApiRateLimitError | None = None
+
+        for query in self.queries:
+            query_key = self._query_key(query)
+            try:
                 query_key, query_result = await self._fetch_one_query(query, now)
-                result_data[query_key] = query_result
-        except RealtimeTrainsApiAuthError as err:
-            raise ConfigEntryAuthFailed(err) from err
-        except RealtimeTrainsApiRateLimitError as err:
-            backoff = err.retry_after if (err.retry_after is not None and err.retry_after > 0) else 60
+            except RealtimeTrainsApiAuthError as err:
+                raise ConfigEntryAuthFailed(err) from err
+            except RealtimeTrainsApiError as err:
+                failures.append(err)
+                if isinstance(err, RealtimeTrainsApiRateLimitError) and rate_limit_err is None:
+                    rate_limit_err = err
+                last_known = previous.get(query_key)
+                if last_known is not None:
+                    result_data[query_key] = {**last_known, "data_stale": True}
+                continue
+            except Exception as err:
+                raise UpdateFailed(f"Unexpected error: {err}") from err
+
+            query_result["data_stale"] = False
+            query_result["last_successful_update"] = now.isoformat()
+            result_data[query_key] = query_result
+
+        if rate_limit_err is not None:
+            backoff = (
+                rate_limit_err.retry_after
+                if (rate_limit_err.retry_after is not None and rate_limit_err.retry_after > 0)
+                else 60
+            )
             self._set_polling_interval(max(self.current_polling_interval, backoff))
-            stale = self._serve_stale_data(f"Rate limit hit: {err}")
-            if stale is not None:
-                return stale
-            raise UpdateFailed(f"Rate limit hit: {err}") from err
-        except RealtimeTrainsApiError as err:
-            stale = self._serve_stale_data(f"Error communicating with API: {err}")
-            if stale is not None:
-                return stale
-            raise UpdateFailed(f"Error communicating with API: {err}") from err
-        except Exception as err:
-            raise UpdateFailed(f"Unexpected error: {err}") from err
+
+        if failures:
+            reason = (
+                f"Rate limit hit: {rate_limit_err}"
+                if rate_limit_err is not None
+                else f"Error communicating with API: {failures[0]}"
+            )
+            if not result_data:
+                raise UpdateFailed(reason) from failures[0]
+            self.data_stale = True
+            _LOGGER.warning(
+                "%s of %s queries could not be refreshed; serving last-known data for them: %s",
+                len(failures),
+                len(self.queries),
+                reason,
+            )
+            return result_data
 
         self.data_stale = False
         self.last_successful_update = now
@@ -627,12 +670,3 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._set_polling_interval(max(NO_TRAINS_BACKOFF_SECONDS, target_interval))
 
         return result_data
-
-    def _serve_stale_data(self, reason: str) -> dict[str, Any] | None:
-        """Return the last-known data marked stale, or None when there is none."""
-        last_known = getattr(self, "data", None)
-        if not last_known:
-            return None
-        self.data_stale = True
-        _LOGGER.warning("Serving last-known train data: %s", reason)
-        return last_known

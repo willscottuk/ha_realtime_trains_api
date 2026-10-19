@@ -78,7 +78,7 @@ async def test_coordinator_rate_limit_error_fallback_and_stale_data():
     coordinator.data = {"WAL_WAT_all_0": {"next_trains": []}}
 
     data = await coordinator._async_update_data()
-    assert data == {"WAL_WAT_all_0": {"next_trains": []}}
+    assert data == {"WAL_WAT_all_0": {"next_trains": [], "data_stale": True}}
     assert coordinator.data_stale is True
     assert coordinator.current_polling_interval == 60
     assert coordinator.update_interval == timedelta(seconds=60)
@@ -338,9 +338,86 @@ async def test_stale_data_served_on_rate_limit():
     with freeze_time("2026-04-07 12:01:00"):
         stale = await coordinator._async_update_data()
 
-    assert stale is good_data
+    assert stale == {
+        key: {**value, "data_stale": True} for key, value in good_data.items()
+    }
+    assert stale["WAL_WAT_all_0"]["last_successful_update"] == (
+        good_data["WAL_WAT_all_0"]["last_successful_update"]
+    )
     assert coordinator.data_stale is True
     assert coordinator.last_successful_update is not None
+
+
+@pytest.mark.asyncio
+async def test_one_failed_query_keeps_fresh_results_of_the_others():
+    """A failure part-way through a poll must not discard the queries that worked."""
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(return_value={"services": [_service("S1")]})
+
+    queries = [
+        {"origin": "WAL", "destination": "WAT"},
+        {"origin": "WAL", "destination": "CLJ"},
+    ]
+    coordinator = _make_coordinator(api, queries)
+
+    with freeze_time("2026-04-07 12:00:00"):
+        coordinator.data = await coordinator._async_update_data()
+
+    async def second_query_rate_limited(origin, destination, *args, **kwargs):
+        if destination == "CLJ":
+            raise RealtimeTrainsApiRateLimitError("Rate limit", retry_after=600)
+        return {"services": [_service("S2", "2026-04-07T12:10:00Z")]}
+
+    api.fetch_location_services = AsyncMock(side_effect=second_query_rate_limited)
+    with freeze_time("2026-04-07 12:01:00"):
+        data = await coordinator._async_update_data()
+
+    fresh = data["WAL_WAT_all_0"]
+    assert fresh["data_stale"] is False
+    assert [t["service_uid"] for t in fresh["next_trains"]] == ["S2"]
+    assert fresh["last_successful_update"].startswith("2026-04-07T13:01")
+
+    stale = data["WAL_CLJ_all_0"]
+    assert stale["data_stale"] is True
+    assert [t["service_uid"] for t in stale["next_trains"]] == ["S1"]
+
+    assert coordinator.data_stale is True
+    assert coordinator.current_polling_interval == 600
+
+
+@pytest.mark.asyncio
+async def test_failed_query_without_previous_data_is_omitted():
+    api = MagicMock()
+
+    async def first_query_fails(origin, destination, *args, **kwargs):
+        if destination == "WAT":
+            raise RealtimeTrainsApiError("boom")
+        return {"services": [_service("S1")]}
+
+    api.fetch_location_services = AsyncMock(side_effect=first_query_fails)
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}, {"origin": "WAL", "destination": "CLJ"}],
+    )
+
+    with freeze_time("2026-04-07 12:00:00"):
+        data = await coordinator._async_update_data()
+
+    assert set(data) == {"WAL_CLJ_all_0"}
+    assert coordinator.data_stale is True
+
+
+@pytest.mark.asyncio
+async def test_all_queries_failing_without_previous_data_raises():
+    api = MagicMock()
+    api.fetch_location_services = AsyncMock(side_effect=RealtimeTrainsApiError("boom"))
+    coordinator = _make_coordinator(
+        api,
+        [{"origin": "WAL", "destination": "WAT"}, {"origin": "WAL", "destination": "CLJ"}],
+    )
+
+    with freeze_time("2026-04-07 12:00:00"), pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
 
 
 @pytest.mark.asyncio

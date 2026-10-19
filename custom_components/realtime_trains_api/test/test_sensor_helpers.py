@@ -273,6 +273,16 @@ def test_sensor_unrecorded_attributes_and_empty_next_trains():
     assert ATTR_NEXT_TRAINS in attrs
     assert attrs["contract_version"] == 2
     assert "schema_version" not in attrs
+    # Without per-query freshness, the coordinator-wide values are used
+    assert attrs[ATTR_DATA_STALE] is False
+
+    # Per-query freshness wins when the coordinator provides it
+    coordinator.data_stale = True
+    coordinator.data["BKH_all_all_0_0"]["data_stale"] = False
+    coordinator.data["BKH_all_all_0_0"]["last_successful_update"] = "2026-04-07T12:00:00+01:00"
+    attrs = sensor.extra_state_attributes
+    assert attrs[ATTR_DATA_STALE] is False
+    assert attrs[ATTR_LAST_SUCCESSFUL_UPDATE] == "2026-04-07T12:00:00+01:00"
 
 
 def test_calculate_service_status_cases() -> None:
