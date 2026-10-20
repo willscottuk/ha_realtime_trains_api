@@ -1073,3 +1073,34 @@ def test_journey_call_rate_is_logged_from_each_poll():
     _, fresh = _morning_budget_coordinator()
     fresh._journey_call_log.append((start, 4))
     assert fresh._journey_call_rate(start + timedelta(minutes=5)) is None
+
+
+def test_tight_budget_stretches_polls_instead_of_waiting_for_reset():
+    api, coordinator = _morning_budget_coordinator()
+    now = datetime(2026, 10, 20, 22, 0, tzinfo=TIMEZONE)  # 21:00 UTC
+    api.rate_limits["hour"]["remaining"] = 100
+    api.rate_limits["day"]["remaining"] = 100
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+    coordinator._journey_call_log.extend(
+        (now - timedelta(minutes=60 - 20 * i), 9) for i in range(3)
+    )
+    seconds_to_reset = 3 * 3600
+
+    # 50 usable calls can't cover 27 journey lookups an hour until quiet
+    # hours, but those only happen when we poll: poll sparsely, don't stop
+    interval = coordinator._budget_interval(now, 300)
+    assert 300 < interval < seconds_to_reset
+    assert interval == pytest.approx(300 * 30 * 8 / 50, abs=30)
+
+
+def test_journey_calls_are_counted_at_the_api_when_it_can():
+    api, coordinator = _morning_budget_coordinator()
+    api.journey_request_count = 0
+    start = datetime(2026, 10, 20, 10, 0, tzinfo=TIMEZONE)
+    coordinator._estimate_calls_per_poll(start)
+
+    # A location lookup retried after an auth refresh: 3 location calls, 1 journey
+    api.request_count += 4
+    api.journey_request_count += 1
+    coordinator._estimate_calls_per_poll(start + timedelta(minutes=10))
+    assert [calls for _, calls in coordinator._journey_call_log] == [1]

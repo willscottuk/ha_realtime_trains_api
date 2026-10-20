@@ -118,6 +118,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._calls_per_poll: float | None = None
         self._request_count_at_last_poll: int | None = None
+        self._journey_count_at_last_poll: int | None = None
         self._last_poll_started: datetime | None = None
         # (poll start, journey-detail calls that poll made) for recent polls
         self._journey_call_log: deque[tuple[datetime, int]] = deque()
@@ -348,13 +349,20 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         journey-detail lookups, for `_journey_call_rate`.
         """
         count = getattr(self.api, "request_count", None)
+        journey = getattr(self.api, "journey_request_count", None)
+        if not isinstance(journey, int) or isinstance(journey, bool):
+            journey = None
         if isinstance(count, int) and not isinstance(count, bool):
             if self._request_count_at_last_poll is not None:
                 made = count - self._request_count_at_last_poll
                 if now is not None and self._last_poll_started is not None and made >= 0:
-                    self._journey_call_log.append(
-                        (self._last_poll_started, max(0, made - len(self.queries)))
-                    )
+                    if journey is not None and self._journey_count_at_last_poll is not None:
+                        # Counted at the API, so auth retries of a location
+                        # lookup aren't mistaken for journey lookups
+                        journey_made = max(0, journey - self._journey_count_at_last_poll)
+                    else:
+                        journey_made = max(0, made - len(self.queries))
+                    self._journey_call_log.append((self._last_poll_started, journey_made))
                 if made > 0:
                     # Rise straight to a bigger poll, decay slowly from one,
                     # so a burst of new trains isn't averaged away
@@ -364,6 +372,7 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         else (self._calls_per_poll + made) / 2
                     )
             self._request_count_at_last_poll = count
+            self._journey_count_at_last_poll = journey
 
         if now is not None:
             self._last_poll_started = now
@@ -471,8 +480,9 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 per_poll = float(len(self.queries) or 1)
                 for_polls = usable - journey_rate * active_seconds
                 if for_polls < per_poll:
-                    interval = max(interval, seconds_left + 1)
-                    continue
+                    # Journey lookups only happen when we poll, so sparse
+                    # polling can still fit: price each poll at the average
+                    per_poll, for_polls = calls_per_poll, usable
             if planned * per_poll > for_polls:
                 stretched = target_interval * planned * per_poll / for_polls
                 interval = max(interval, min(stretched, seconds_left + 1))

@@ -193,6 +193,7 @@ async def test_fetch_service_details_uses_date(sample_departures: dict) -> None:
 
     assert data["location"]["crs"] == "BKH"
     assert session.calls[-1][0] == service_url
+    assert (client.request_count, client.journey_request_count) == (1, 1)
 
 
 @pytest.mark.asyncio
@@ -272,6 +273,7 @@ async def test_requests_are_counted_and_limits_timestamped(sample_departures: di
     await client.fetch_location_services("BKH", "CST")
 
     assert client.request_count == 2
+    assert client.journey_request_count == 0
     assert client.rate_limits_updated_at is not None
 
 
