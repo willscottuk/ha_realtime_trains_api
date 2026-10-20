@@ -1001,3 +1001,75 @@ def test_budget_does_not_plan_polls_in_quiet_hours():
 
     # Fewer planned polls means each one can come sooner
     assert 300 < with_quiet < without_quiet
+
+
+def _morning_budget_coordinator():
+    """The setup from a live report: 2 queries, 8 enriched trains, quiet nights."""
+    api = MagicMock()
+    api.request_count = 0
+    api.rate_limits = {
+        "minute": {"limit": 10, "remaining": 2},
+        "hour": {"limit": 100, "remaining": 77},
+        "day": {"limit": 1000, "remaining": 965},
+        "week": {"limit": 10000, "remaining": 9279},
+    }
+    coordinator = _make_coordinator(
+        api,
+        [
+            {"origin": "ECR", "destination": "VIC", "journey_data_for_next_X_trains": 5},
+            {"origin": "ECR", "destination": "LBG", "journey_data_for_next_X_trains": 3},
+        ],
+        peak_interval=60,
+        off_peak_interval=300,
+        peak_windows=[(time(7, 0), time(9, 30)), (time(16, 0), time(19, 0))],
+        quiet_windows=[(time(0, 30), time(5, 30))],
+    )
+    coordinator._calls_per_poll = 8.0
+    return api, coordinator
+
+
+def test_budget_prices_cached_journey_lookups_by_time_not_per_poll():
+    api, coordinator = _morning_budget_coordinator()
+    now = datetime(2026, 10, 20, 6, 45, tzinfo=TIMEZONE)  # 05:45 UTC
+    api.rate_limits_updated_at = now.astimezone(timezone.utc)
+
+    # Before any journey rate is measured: every poll is priced at 8 calls,
+    # which stretched 5-minute polling to about 20 minutes
+    assert coordinator._budget_interval(now, 300) == pytest.approx(1250, abs=30)
+
+    # Measured: 27 journey lookups over the last hour, however often we polled
+    coordinator._journey_call_log.extend(
+        (now - timedelta(minutes=60 - 20 * i), 9) for i in range(3)
+    )
+    rate = coordinator._journey_call_rate(now)
+    assert rate * 3600 == pytest.approx(27)
+
+    off_peak = coordinator._budget_interval(now, 300)
+    peak = coordinator._budget_interval(now, 60)
+    assert off_peak < 800
+    assert peak == pytest.approx(off_peak / 5, abs=2)
+
+    # ...and the plan still fits what's left of the day
+    reset = datetime(2026, 10, 21, 0, 0, tzinfo=timezone.utc).astimezone(TIMEZONE)
+    planned, active = coordinator._planned_schedule(now, reset)
+    usable = 965 - 50
+    spent = planned * (300 / off_peak) * 2 + rate * active
+    assert spent <= usable
+
+
+def test_journey_call_rate_is_logged_from_each_poll():
+    api, coordinator = _morning_budget_coordinator()
+    start = datetime(2026, 10, 20, 10, 0, tzinfo=TIMEZONE)
+
+    # Each poll makes 2 location calls plus some journey lookups
+    for minute, made in [(0, 0), (10, 6), (20, 3), (30, 2)]:
+        api.request_count += made
+        coordinator._estimate_calls_per_poll(start + timedelta(minutes=minute))
+    # The first poll's calls predate the log; then 4, 1 and 0 journey calls
+    assert [calls for _, calls in coordinator._journey_call_log] == [4, 1, 0]
+    assert coordinator._journey_call_rate(start + timedelta(minutes=30)) == pytest.approx(5 / 1800)
+
+    # Too short a history isn't trusted
+    _, fresh = _morning_budget_coordinator()
+    fresh._journey_call_log.append((start, 4))
+    assert fresh._journey_call_rate(start + timedelta(minutes=5)) is None
