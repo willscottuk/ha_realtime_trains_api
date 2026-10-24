@@ -51,6 +51,8 @@ class RealtimeTrainsApiClient:
         self.rate_limits_updated_at: datetime | None = None
         # Total requests sent, so callers can measure what a poll costs
         self.request_count = 0
+        # The share of request_count that were journey-detail lookups
+        self.journey_request_count = 0
         self._recent_requests: deque[float] = deque()
         # (monotonic time, X-RateLimit-Remaining-Minute) from the last response
         self._minute_remaining_reading: tuple[float, int] | None = None
@@ -135,7 +137,7 @@ class RealtimeTrainsApiClient:
         if isinstance(run_date, datetime):
             run_date = run_date.date()
         path = f"gb-nr/service?identity={service_uid}&departureDate={run_date.isoformat()}"
-        return await self._request(path)
+        return await self._request(path, journey=True)
 
     def _minute_wait_from_server(self, now: float) -> float:
         """Seconds to wait because the API reported the minute budget spent.
@@ -182,7 +184,7 @@ class RealtimeTrainsApiClient:
                 await asyncio.sleep(delay)
             self._recent_requests.append(time.monotonic())
 
-    async def _request(self, path: str) -> dict[str, Any]:
+    async def _request(self, path: str, journey: bool = False) -> dict[str, Any]:
         url = f"{API_BASE}{path}"
         
         # Check if we should preemptively skip
@@ -194,6 +196,8 @@ class RealtimeTrainsApiClient:
 
         await self._wait_for_minute_budget()
         self.request_count += 1
+        if journey:
+            self.journey_request_count += 1
 
         try:
             async with self._session.get(url, headers=self._headers) as response:

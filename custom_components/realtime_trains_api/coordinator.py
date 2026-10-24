@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 from datetime import datetime, timedelta, timezone
 import logging
 import math
@@ -66,6 +67,9 @@ JOURNEY_DATA_CACHE_MAX_AGE = timedelta(hours=4)
 # Share of each hourly/daily rate-limit budget held back for restarts and
 # manual refreshes when pacing polls.
 RATE_LIMIT_RESERVE_FRACTION = 0.05
+# Journey-detail calls are budgeted as a rate measured over recent polls
+JOURNEY_CALL_RATE_WINDOW = timedelta(hours=2)
+JOURNEY_CALL_RATE_MIN_SPAN = timedelta(minutes=15)
 
 def _delta_seconds(hhmm_datetime_a: datetime, hhmm_datetime_b: datetime) -> float:
     a_trunc = hhmm_datetime_a.replace(second=0, microsecond=0)
@@ -114,6 +118,10 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._calls_per_poll: float | None = None
         self._request_count_at_last_poll: int | None = None
+        self._journey_count_at_last_poll: int | None = None
+        self._last_poll_started: datetime | None = None
+        # (poll start, journey-detail calls that poll made) for recent polls
+        self._journey_call_log: deque[tuple[datetime, int]] = deque()
         self.budget_limited = False
 
     async def _async_refresh_token(self) -> bool:
@@ -334,12 +342,27 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Measured average API calls per poll, once known."""
         return round(self._calls_per_poll, 1) if self._calls_per_poll is not None else None
 
-    def _estimate_calls_per_poll(self) -> float:
-        """Update and return the average number of API calls a poll makes."""
+    def _estimate_calls_per_poll(self, now: datetime | None = None) -> float:
+        """Update and return the average number of API calls a poll makes.
+
+        With `now`, also logs how many of the previous poll's calls were
+        journey-detail lookups, for `_journey_call_rate`.
+        """
         count = getattr(self.api, "request_count", None)
+        journey = getattr(self.api, "journey_request_count", None)
+        if not isinstance(journey, int) or isinstance(journey, bool):
+            journey = None
         if isinstance(count, int) and not isinstance(count, bool):
             if self._request_count_at_last_poll is not None:
                 made = count - self._request_count_at_last_poll
+                if now is not None and self._last_poll_started is not None and made >= 0:
+                    if journey is not None and self._journey_count_at_last_poll is not None:
+                        # Counted at the API, so auth retries of a location
+                        # lookup aren't mistaken for journey lookups
+                        journey_made = max(0, journey - self._journey_count_at_last_poll)
+                    else:
+                        journey_made = max(0, made - len(self.queries))
+                    self._journey_call_log.append((self._last_poll_started, journey_made))
                 if made > 0:
                     # Rise straight to a bigger poll, decay slowly from one,
                     # so a burst of new trains isn't averaged away
@@ -349,11 +372,32 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         else (self._calls_per_poll + made) / 2
                     )
             self._request_count_at_last_poll = count
+            self._journey_count_at_last_poll = journey
+
+        if now is not None:
+            self._last_poll_started = now
+            while self._journey_call_log and now - self._journey_call_log[0][0] > JOURNEY_CALL_RATE_WINDOW:
+                self._journey_call_log.popleft()
 
         if self._calls_per_poll is not None:
             return self._calls_per_poll
         # Nothing measured yet: assume the worst case of every lookup
         return float(self._max_calls_per_poll())
+
+    def _journey_call_rate(self, now: datetime) -> float | None:
+        """Journey-detail calls per second over recent polls, once measurable.
+
+        Journey details are cached, so they are fetched when a new train
+        joins the list or the next departure is due a refresh. That depends
+        on time passing, not on how often we poll, so it is budgeted as a
+        rate rather than as a cost of every poll.
+        """
+        if not self._journey_call_log:
+            return None
+        span = (now - self._journey_call_log[0][0]).total_seconds()
+        if span < JOURNEY_CALL_RATE_MIN_SPAN.total_seconds():
+            return None
+        return sum(calls for _, calls in self._journey_call_log) / span
 
     def _max_calls_per_poll(self) -> int:
         """Most calls one poll can make: every location lookup plus every
@@ -362,7 +406,12 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _planned_polls(self, now: datetime, until: datetime) -> float:
         """Polls the configured schedule would make before `until` (none in quiet hours)."""
+        return self._planned_schedule(now, until)[0]
+
+    def _planned_schedule(self, now: datetime, until: datetime) -> tuple[float, float]:
+        """Return (planned polls, seconds of active polling) before `until`."""
         polls = 0.0
+        active_seconds = 0.0
         step = timedelta(minutes=1)
         moment = now
         while moment < until:
@@ -371,8 +420,9 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             interval = self.peak_interval if self._is_peak(moment) else self.off_peak_interval
             polls += 60 / max(interval, 1)
+            active_seconds += 60
             moment += step
-        return polls
+        return polls, active_seconds
 
     def _budget_interval(self, now: datetime, target_interval: int) -> int:
         """Return a polling interval that keeps the hourly and daily budgets.
@@ -384,7 +434,8 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         window resets on the clock hour and the day window at 00:00 UTC
         (as observed from the API's counters).
         """
-        calls_per_poll = self._estimate_calls_per_poll()
+        calls_per_poll = self._estimate_calls_per_poll(now)
+        journey_rate = self._journey_call_rate(now)
         rate_limits = getattr(self.api, "rate_limits", None)
         updated_at = getattr(self.api, "rate_limits_updated_at", None)
         if not isinstance(rate_limits, dict) or not isinstance(updated_at, datetime):
@@ -418,9 +469,22 @@ class RealtimeTrainsUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 interval = max(interval, seconds_left + 1)
                 continue
 
-            planned = self._planned_polls(now, reset_at.astimezone(now.tzinfo or TIMEZONE))
-            if planned * calls_per_poll > usable:
-                stretched = target_interval * planned * calls_per_poll / usable
+            planned, active_seconds = self._planned_schedule(
+                now, reset_at.astimezone(now.tzinfo or TIMEZONE)
+            )
+            if journey_rate is None:
+                # Not measured yet: assume every poll costs the average
+                per_poll, for_polls = calls_per_poll, usable
+            else:
+                # Location lookups scale with polls; journey lookups with time
+                per_poll = float(len(self.queries) or 1)
+                for_polls = usable - journey_rate * active_seconds
+                if for_polls < per_poll:
+                    # Journey lookups only happen when we poll, so sparse
+                    # polling can still fit: price each poll at the average
+                    per_poll, for_polls = calls_per_poll, usable
+            if planned * per_poll > for_polls:
+                stretched = target_interval * planned * per_poll / for_polls
                 interval = max(interval, min(stretched, seconds_left + 1))
 
         self.budget_limited = interval > target_interval
